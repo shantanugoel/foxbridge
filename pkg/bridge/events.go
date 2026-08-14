@@ -1063,6 +1063,14 @@ func (b *Bridge) emitPageAttachOnSession(pair *targetPair, parentSessionID strin
 		}
 		pair.pageAttachedRoot = true
 	} else {
+		// A flattened CDP session ID is global to the connection. Re-emitting the
+		// same page session beneath its synthetic tab makes Puppeteer replace the
+		// session object; responses then reach the replacement while requests are
+		// pending on the original object.
+		if pair.pageAttachedRoot {
+			b.autoAttach.mu.Unlock()
+			return
+		}
 		if pair.pageAttachedTab {
 			b.autoAttach.mu.Unlock()
 			return

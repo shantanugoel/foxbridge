@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -261,7 +262,7 @@ func TestServer_JSONVersion_Fields(t *testing.T) {
 	}
 
 	// Verify the WS URL has the expected format
-	expected := fmt.Sprintf("ws://127.0.0.1:%d/devtools/browser/foxbridge", 9222)
+	expected := "ws://" + strings.TrimPrefix(ts.URL, "http://") + "/devtools/browser/foxbridge"
 	if info["webSocketDebuggerUrl"] != expected {
 		t.Errorf("webSocketDebuggerUrl = %q, want %q", info["webSocketDebuggerUrl"], expected)
 	}

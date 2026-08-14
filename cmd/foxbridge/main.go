@@ -28,6 +28,7 @@ func main() {
 	}
 
 	port := flag.Int("port", 9222, "CDP WebSocket port")
+	host := flag.String("host", "127.0.0.1", "CDP HTTP/WebSocket listen address")
 	socket := flag.String("socket", "", "Unix-domain socket path for the CDP HTTP/WebSocket server")
 	recordPath := flag.String("record", "", "Path to write a CDP wire recording as JSONL")
 	binary := flag.String("binary", "", "Firefox/Camoufox binary path")
@@ -117,6 +118,7 @@ func main() {
 	server := cdp.NewServer(*port, func(conn *cdp.Connection, msg *cdp.Message) {
 		b.HandleMessage(conn, msg)
 	}, sessions)
+	server.SetHost(*host)
 	if *socket != "" {
 		server.SetUnixSocket(*socket)
 	}

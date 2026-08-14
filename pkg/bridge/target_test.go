@@ -193,6 +193,7 @@ func TestHandleTarget_SetAutoAttach_SessionLevel_Tab(t *testing.T) {
 		pageTargetID:  "page-t1",
 		browserCtxID:  "ctx-1",
 	}
+	pair.pageAttachedRoot = true
 	b.autoAttach.mu.Lock()
 	b.autoAttach.pairs["jug-1"] = pair
 	b.autoAttach.mu.Unlock()
@@ -209,6 +210,9 @@ func TestHandleTarget_SetAutoAttach_SessionLevel_Tab(t *testing.T) {
 	}
 	if string(result) != "{}" {
 		t.Errorf("result = %s, want {}", string(result))
+	}
+	if pair.pageAttachedTab {
+		t.Error("page already attached at root must not be emitted again under its tab")
 	}
 }
 

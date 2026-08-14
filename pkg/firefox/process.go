@@ -83,10 +83,9 @@ func (p *Process) Start(cfg Config) error {
 	args = append(args, cfg.ExtraArgs...)
 
 	cmd := exec.Command(bin, args...)
-	// Suppress Firefox output
-	devNull, _ := os.Open(os.DevNull)
-	cmd.Stdout = devNull
-	cmd.Stderr = devNull
+	// Keep browser diagnostics visible to the process supervisor/container logs.
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
 
 	if !biDiOnly {
 		// Create pipes for Juggler transport (FD 3 read, FD 4 write from Firefox's perspective).

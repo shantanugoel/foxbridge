@@ -173,6 +173,31 @@ func (s *Server) targetWSURL(targetID string) string {
 	return s.discoveryBaseURL() + "/devtools/page/" + targetID
 }
 
+func (s *Server) browserWSURLForRequest(r *http.Request) string {
+	return s.discoveryBaseURLForRequest(r) + "/devtools/browser/foxbridge"
+}
+
+func (s *Server) targetWSURLForRequest(r *http.Request, targetID string) string {
+	return s.discoveryBaseURLForRequest(r) + "/devtools/page/" + targetID
+}
+
+// discoveryBaseURLForRequest advertises the host used by the client. This is
+// important when foxbridge listens on 0.0.0.0 behind a container port mapping:
+// 0.0.0.0 is a listen address, not a useful externally reachable endpoint.
+func (s *Server) discoveryBaseURLForRequest(r *http.Request) string {
+	if s.socket != "" {
+		return "ws://localhost"
+	}
+	if r != nil && r.Host != "" {
+		scheme := "ws"
+		if r.TLS != nil {
+			scheme = "wss"
+		}
+		return fmt.Sprintf("%s://%s", scheme, r.Host)
+	}
+	return s.discoveryBaseURL()
+}
+
 func (s *Server) discoveryBaseURL() string {
 	if s.socket != "" {
 		return "ws://localhost"
@@ -311,7 +336,7 @@ func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
 		"Browser":              "foxbridge/1.0",
 		"Protocol-Version":     "1.3",
 		"User-Agent":           "foxbridge",
-		"webSocketDebuggerUrl": s.BrowserWSURL(),
+		"webSocketDebuggerUrl": s.browserWSURLForRequest(r),
 	}
 	if s.socket != "" {
 		info["socketPath"] = s.socket
@@ -341,7 +366,7 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 			"title":                info.Title,
 			"url":                  url,
 			"devtoolsFrontendUrl":  "",
-			"webSocketDebuggerUrl": s.targetWSURL(info.TargetID),
+			"webSocketDebuggerUrl": s.targetWSURLForRequest(r, info.TargetID),
 		})
 		if s.socket != "" {
 			targets[len(targets)-1]["socketPath"] = s.socket
