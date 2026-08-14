@@ -15,6 +15,11 @@ func (b *Bridge) handleTarget(conn *cdp.Connection, msg *cdp.Message) (json.RawM
 	case "Target.setDiscoverTargets":
 		// Emit targetCreated for all known targets (both tabs and pages).
 		for _, info := range b.sessions.All() {
+			// Flat CDP clients consume page targets directly. Advertising the
+			// synthetic tab as well makes them wait for a redundant child attach.
+			if info.Type == "tab" {
+				continue
+			}
 			url := info.URL
 			if url == "" && info.Type == "page" {
 				url = "about:blank"

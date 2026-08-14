@@ -1042,7 +1042,6 @@ func (b *Bridge) emitTabAttach(pair *targetPair) {
 }
 
 func (b *Bridge) emitAutoAttachPair(pair *targetPair) {
-	b.emitTabAttach(pair)
 	b.emitPageAttachOnSession(pair, "")
 }
 
