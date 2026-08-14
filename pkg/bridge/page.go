@@ -360,6 +360,7 @@ func (b *Bridge) handlePage(conn *cdp.Connection, msg *cdp.Message) (json.RawMes
 		}
 		if targetJugglerCtx != "" {
 			b.ctxMap[ctxID] = targetJugglerCtx
+			b.ctxOwners[ctxID] = msg.SessionID
 		}
 		b.ctxMapMu.Unlock()
 

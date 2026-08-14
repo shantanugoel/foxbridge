@@ -36,6 +36,7 @@ func (b *Bridge) handleRuntime(conn *cdp.Connection, msg *cdp.Message) (json.Raw
 				ctxID := b.nextCtxID()
 				b.ctxMapMu.Lock()
 				b.ctxMap[ctxID] = latestCtx
+				b.ctxOwners[ctxID] = msg.SessionID
 				b.ctxMapMu.Unlock()
 
 				b.emitEvent("Runtime.executionContextCreated", map[string]interface{}{
@@ -72,6 +73,9 @@ func (b *Bridge) handleRuntime(conn *cdp.Connection, msg *cdp.Message) (json.Raw
 		}
 
 		// Map CDP contextId (numeric) to Juggler executionContextId (string)
+		if params.ContextID > 0 && !b.contextOwned(msg.SessionID, params.ContextID) {
+			return nil, &cdp.Error{Code: -32000, Message: "execution context not found"}
+		}
 		execCtxID := params.UniqueContextID
 		if execCtxID == "" && params.ContextID > 0 {
 			b.ctxMapMu.RLock()
@@ -132,6 +136,9 @@ func (b *Bridge) handleRuntime(conn *cdp.Connection, msg *cdp.Message) (json.Raw
 		}
 
 		// Map CDP contextId to Juggler executionContextId
+		if params.ExecutionContextID > 0 && !b.contextOwned(msg.SessionID, params.ExecutionContextID) {
+			return nil, &cdp.Error{Code: -32000, Message: "execution context not found"}
+		}
 		execCtxID := params.UniqueContextID
 		if execCtxID == "" && params.ExecutionContextID > 0 {
 			b.ctxMapMu.RLock()

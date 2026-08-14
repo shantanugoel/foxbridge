@@ -23,6 +23,7 @@ type Bridge struct {
 	// ctxMap maps numeric CDP execution context IDs to Juggler execution context ID strings
 	ctxMapMu   sync.RWMutex
 	ctxMap     map[int]string // cdpContextID → jugglerContextID
+	ctxOwners  map[int]string // cdpContextID → owning CDP session
 	ctxCounter int            // monotonic counter for execution context IDs
 	// loaderMap tracks the last loaderId per CDP session for lifecycle event consistency
 	loaderMapMu sync.RWMutex
@@ -92,6 +93,7 @@ func New(b backend.Backend, sessions *cdp.SessionManager, server *cdp.Server, is
 		server:               server,
 		autoAttach:           newAutoAttachState(),
 		ctxMap:               make(map[int]string),
+		ctxOwners:            make(map[int]string),
 		ctxCounter:           100,
 		loaderMap:            make(map[string]string),
 		latestCtx:            make(map[string]string),
@@ -253,8 +255,9 @@ func (b *Bridge) clearConnectionState(records []*targetRecord) {
 
 		b.ctxMapMu.Lock()
 		for id, jugglerID := range b.ctxMap {
-			if jugglerID == record.jugglerSessionID {
+			if jugglerID == record.jugglerSessionID || b.ctxOwners[id] == record.pageSessionID {
 				delete(b.ctxMap, id)
+				delete(b.ctxOwners, id)
 			}
 		}
 		b.ctxMapMu.Unlock()
@@ -274,6 +277,7 @@ func (b *Bridge) ownedTarget(conn *cdp.Connection, targetID string) bool {
 }
 
 func (b *Bridge) closeRecord(record *targetRecord, closeBackend bool) {
+	owner, _, _ := b.ownership.recordDetails(record)
 	if !b.ownership.beginCleanup(record) {
 		return
 	}
@@ -282,11 +286,11 @@ func (b *Bridge) closeRecord(record *targetRecord, closeBackend bool) {
 			log.Printf("[ownership] close target %s: %v", record.pageTargetID, err)
 		}
 	}
-	b.emitEvent("Target.detachedFromTarget", map[string]interface{}{
+	b.sendOwnedEvent(owner, "Target.detachedFromTarget", map[string]interface{}{
 		"sessionId": record.pageSessionID,
 		"targetId":  record.pageTargetID,
 	}, "")
-	b.emitEvent("Target.targetDestroyed", map[string]interface{}{
+	b.sendOwnedEvent(owner, "Target.targetDestroyed", map[string]interface{}{
 		"targetId": record.pageTargetID,
 	}, "")
 	b.sessions.Remove(record.pageSessionID)
@@ -295,8 +299,25 @@ func (b *Bridge) closeRecord(record *targetRecord, closeBackend bool) {
 	if record.jugglerSessionID != "" {
 		delete(b.autoAttach.pairs, record.jugglerSessionID)
 	}
+	pending := b.autoAttach.pending[:0]
+	for _, candidate := range b.autoAttach.pending {
+		if candidate != record.pair {
+			pending = append(pending, candidate)
+		}
+	}
+	b.autoAttach.pending = pending
 	b.autoAttach.mu.Unlock()
 	b.ownership.remove(record)
+}
+
+func (b *Bridge) sendOwnedEvent(owner *cdp.Connection, method string, params interface{}, sessionID string) {
+	if owner == nil {
+		return
+	}
+	raw, _ := json.Marshal(params)
+	if err := b.server.Send(owner, &cdp.Message{Method: method, Params: raw, SessionID: sessionID}); err != nil {
+		log.Printf("[event] send %s: %v", method, err)
+	}
 }
 
 func (b *Bridge) publishOwnedPair(pair *targetPair) {
@@ -308,6 +329,15 @@ func (b *Bridge) publishOwnedPair(pair *targetPair) {
 	if owner == nil || cancelled {
 		return
 	}
+	b.autoAttach.mu.Lock()
+	pending := b.autoAttach.pending[:0]
+	for _, candidate := range b.autoAttach.pending {
+		if candidate != pair {
+			pending = append(pending, candidate)
+		}
+	}
+	b.autoAttach.pending = pending
+	b.autoAttach.mu.Unlock()
 	if b.ownership.discoverEnabled(owner) {
 		b.autoAttach.mu.Lock()
 		url := pair.url
@@ -365,6 +395,24 @@ func (b *Bridge) nextCtxID() int {
 	id := b.ctxCounter
 	b.ctxMapMu.Unlock()
 	return id
+}
+
+func (b *Bridge) contextOwned(sessionID string, contextID int) bool {
+	b.ctxMapMu.RLock()
+	owner, known := b.ctxOwners[contextID]
+	b.ctxMapMu.RUnlock()
+	return !known || owner == sessionID
+}
+
+func (b *Bridge) clearContextsForSession(sessionID string) {
+	b.ctxMapMu.Lock()
+	for id, owner := range b.ctxOwners {
+		if owner == sessionID {
+			delete(b.ctxMap, id)
+			delete(b.ctxOwners, id)
+		}
+	}
+	b.ctxMapMu.Unlock()
 }
 
 // isolatedWorldInfo tracks an isolated world for re-emission after navigation.
@@ -453,6 +501,23 @@ func (b *Bridge) emitEvent(method string, params interface{}, sessionID string) 
 	}
 }
 
+func (b *Bridge) sessionForFrame(frameID string) (string, bool) {
+	if frameID == "" {
+		return "", false
+	}
+	found := ""
+	for _, info := range b.sessions.All() {
+		if info.Type != "page" || info.FrameID != frameID || b.ownership.ownerForTarget(info.TargetID) == nil {
+			continue
+		}
+		if found != "" && found != info.SessionID {
+			return "", false
+		}
+		found = info.SessionID
+	}
+	return found, found != ""
+}
+
 func (b *Bridge) ownerForEvent(raw json.RawMessage, sessionID string) *cdp.Connection {
 	if sessionID != "" {
 		return nil
@@ -473,10 +538,8 @@ func (b *Bridge) ownerForEvent(raw json.RawMessage, sessionID string) *cdp.Conne
 	if payload.TargetInfo.TargetID != "" {
 		return b.ownership.ownerForTarget(payload.TargetInfo.TargetID)
 	}
-	if payload.FrameID != "" {
-		if info, ok := b.sessions.GetByFrameID(payload.FrameID); ok {
-			return b.ownership.ownerForTarget(info.TargetID)
-		}
+	if cdpSessionID, ok := b.sessionForFrame(payload.FrameID); ok {
+		return b.ownership.sessionOwner(cdpSessionID)
 	}
 	return nil
 }

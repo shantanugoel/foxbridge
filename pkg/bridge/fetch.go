@@ -77,6 +77,13 @@ func (b *Bridge) clearFetchPatterns(sessionID string) {
 	b.fetchPatternsMu.Unlock()
 }
 
+func (b *Bridge) fetchInterceptionEnabled() bool {
+	b.fetchPatternsMu.RLock()
+	enabled := len(b.fetchPatterns) > 0
+	b.fetchPatternsMu.RUnlock()
+	return enabled
+}
+
 func (b *Bridge) shouldPauseFetchRequest(sessionID, url, resourceType, requestStage string) bool {
 	b.fetchPatternsMu.RLock()
 	patterns, enabled := b.fetchPatterns[sessionID]
@@ -118,6 +125,11 @@ func (b *Bridge) callFetchBackend(sessionID, jugglerMethod, bidiMethod string, p
 		return b.callJuggler("", bidiMethod, params)
 	}
 	return b.callJuggler(sessionID, jugglerMethod, params)
+}
+
+func (b *Bridge) continueUnattributedFetchRequest(requestID string) error {
+	_, err := b.callJuggler("", "Browser.continueInterceptedRequest", map[string]interface{}{"requestId": requestID})
+	return err
 }
 
 func (b *Bridge) continueFetchRequest(sessionID, requestID string) error {
@@ -167,7 +179,7 @@ func (b *Bridge) handleFetch(conn *cdp.Connection, msg *cdp.Message) (json.RawMe
 	case "Fetch.disable":
 		b.clearFetchPatterns(msg.SessionID)
 		jugglerParams := map[string]interface{}{
-			"enabled": false,
+			"enabled": b.fetchInterceptionEnabled(),
 		}
 		if msg.SessionID != "" {
 			if info, ok := b.sessions.Get(msg.SessionID); ok {

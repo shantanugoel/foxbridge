@@ -239,9 +239,7 @@ func (b *Bridge) SetupEventSubscriptions() {
 		// BiDi doesn't have an explicit "contexts cleared" event — we emit it on navigation.
 		// Juggler emits its own Runtime.executionContextsCleared, so only do this for BiDi.
 		if b.isBiDi && cdpSessionID != "" {
-			b.ctxMapMu.Lock()
-			b.ctxMap = make(map[int]string)
-			b.ctxMapMu.Unlock()
+			b.clearContextsForSession(cdpSessionID)
 			b.emitEvent("Runtime.executionContextsCleared", map[string]interface{}{}, cdpSessionID)
 		}
 
@@ -352,10 +350,8 @@ func (b *Bridge) SetupEventSubscriptions() {
 	b.backend.Subscribe("Runtime.executionContextsCleared", func(jugglerSessionID string, params json.RawMessage) {
 		cdpSessionID := b.resolveCDPSession(jugglerSessionID)
 		if cdpSessionID != "" {
-			// Clear stale context mappings
-			b.ctxMapMu.Lock()
-			b.ctxMap = make(map[int]string)
-			b.ctxMapMu.Unlock()
+			// Clear stale context mappings for this page only.
+			b.clearContextsForSession(cdpSessionID)
 
 			b.emitEvent("Runtime.executionContextsCleared", map[string]interface{}{}, cdpSessionID)
 
@@ -400,6 +396,7 @@ func (b *Bridge) SetupEventSubscriptions() {
 		// Store the mapping: numeric CDP ID → Juggler string ID
 		b.ctxMapMu.Lock()
 		b.ctxMap[ctxID] = ev.ExecutionContextID
+		b.ctxOwners[ctxID] = cdpSessionID
 		b.ctxMapMu.Unlock()
 
 		// Always track the latest context. Juggler creates/destroys contexts rapidly
@@ -437,6 +434,7 @@ func (b *Bridge) SetupEventSubscriptions() {
 				isoCtxID := b.nextCtxID()
 				b.ctxMapMu.Lock()
 				b.ctxMap[isoCtxID] = ev.ExecutionContextID
+				b.ctxOwners[isoCtxID] = cdpSessionID
 				b.ctxMapMu.Unlock()
 
 				b.emitEvent("Runtime.executionContextCreated", map[string]interface{}{
@@ -484,6 +482,7 @@ func (b *Bridge) SetupEventSubscriptions() {
 				if v == ev.ExecutionContextID {
 					destroyIDs = append(destroyIDs, k)
 					delete(b.ctxMap, k)
+					delete(b.ctxOwners, k)
 				}
 			}
 			b.ctxMapMu.Unlock()
@@ -506,6 +505,7 @@ func (b *Bridge) SetupEventSubscriptions() {
 			if numericID > 0 {
 				b.ctxMapMu.Lock()
 				delete(b.ctxMap, numericID)
+				delete(b.ctxOwners, numericID)
 				b.ctxMapMu.Unlock()
 			}
 
@@ -919,13 +919,17 @@ func (b *Bridge) SetupEventSubscriptions() {
 		// Browser.requestIntercepted is a browser-level event (no juggler session ID).
 		// Resolve the CDP session from the frameId so Puppeteer receives it on the page session.
 		if cdpSessionID == "" && ev.FrameID != "" {
-			if info, ok := b.sessions.GetByFrameID(ev.FrameID); ok {
-				cdpSessionID = info.SessionID
+			if session, ok := b.sessionForFrame(ev.FrameID); ok {
+				cdpSessionID = session
 			}
 		}
 
 		if cdpSessionID == "" {
-			log.Printf("[event] dropping unattributable Browser.requestIntercepted requestId=%s", ev.RequestID)
+			go func() {
+				if err := b.continueUnattributedFetchRequest(ev.RequestID); err != nil {
+					log.Printf("[event] dropping unattributable requestId=%s: %v", ev.RequestID, err)
+				}
+			}()
 			return
 		}
 

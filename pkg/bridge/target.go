@@ -136,6 +136,13 @@ func (b *Bridge) handleTarget(conn *cdp.Connection, msg *cdp.Message) (json.RawM
 		}
 
 		record := b.ownership.claimTarget(conn, targetID, generation)
+		if record == nil && conn != nil {
+			time.AfterFunc(10*time.Second, func() {
+				if late := b.ownership.expireClaim(targetID, generation); late != nil {
+					b.closeRecord(late, true)
+				}
+			})
+		}
 		if b.ownership.connectionClosed(conn) {
 			if record == nil {
 				record = b.ownership.cancelTarget(targetID)
