@@ -322,21 +322,16 @@ func (r *ownershipRegistry) recordDetails(record *targetRecord) (*cdp.Connection
 	return record.owner, record.pair, record.cancelled
 }
 
-func (r *ownershipRegistry) expireClaim(targetID string, generation uint64) *targetRecord {
+func (r *ownershipRegistry) expireClaim(targetID string, generation uint64) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	claim := r.claims[targetID]
 	if claim == nil || claim.generation != generation {
-		return nil
+		return false
 	}
 	delete(r.claims, targetID)
 	r.cancelledTargets[targetID] = true
-	if record := r.targets[targetID]; record != nil {
-		record.cancelled = true
-		record.state = targetClosing
-		return record
-	}
-	return nil
+	return true
 }
 
 func (r *ownershipRegistry) cancelTarget(targetID string) *targetRecord {

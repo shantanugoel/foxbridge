@@ -957,6 +957,8 @@ func (b *Bridge) SetupEventSubscriptions() {
 			return
 		}
 
+		b.ownership.setRequestOwner(ev.RequestID, cdpSessionID)
+
 		// Use top-level fields (new Juggler format) or nested request fields (fallback)
 		url := ev.URL
 		method := ev.Method

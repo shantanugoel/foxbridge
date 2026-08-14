@@ -138,8 +138,11 @@ func (b *Bridge) handleTarget(conn *cdp.Connection, msg *cdp.Message) (json.RawM
 		record := b.ownership.claimTarget(conn, targetID, generation)
 		if record == nil && conn != nil {
 			time.AfterFunc(10*time.Second, func() {
-				if late := b.ownership.expireClaim(targetID, generation); late != nil {
-					b.closeRecord(late, true)
+				if b.ownership.expireClaim(targetID, generation) {
+					log.Printf("[target] createTarget attach timed out for %s; closing backend target", targetID)
+					if _, err := b.callJuggler(targetID, "Page.close", nil); err != nil {
+						log.Printf("[target] failed to close timed-out target %s: %v", targetID, err)
+					}
 				}
 			})
 		}
