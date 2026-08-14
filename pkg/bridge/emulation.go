@@ -8,6 +8,9 @@ import (
 )
 
 func (b *Bridge) handleEmulation(conn *cdp.Connection, msg *cdp.Message) (json.RawMessage, *cdp.Error) {
+	if conn != nil {
+		return nil, &cdp.Error{Code: -32000, Message: "shared browser emulation settings are disabled"}
+	}
 	switch msg.Method {
 	case "Emulation.setGeolocationOverride":
 		var params struct {

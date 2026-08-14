@@ -8,6 +8,12 @@ import (
 )
 
 func (b *Bridge) handleNetwork(conn *cdp.Connection, msg *cdp.Message) (json.RawMessage, *cdp.Error) {
+	if conn != nil {
+		switch msg.Method {
+		case "Network.setRequestInterception", "Network.setUserAgentOverride", "Network.setExtraHTTPHeaders":
+			return nil, &cdp.Error{Code: -32000, Message: "shared browser-global setting is disabled"}
+		}
+	}
 	switch msg.Method {
 	case "Network.enable", "Network.disable":
 		// Juggler auto-enables network events; no-op.
