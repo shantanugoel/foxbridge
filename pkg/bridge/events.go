@@ -169,9 +169,7 @@ func (b *Bridge) SetupEventSubscriptions() {
 			return
 		}
 		if recordOwner != nil {
-			if b.ownership.autoAttachEnabled(recordOwner) {
-				b.publishOwnedPair(pair)
-			}
+			b.publishOwnedPair(pair)
 		} else {
 			b.autoAttach.mu.Lock()
 			if b.autoAttach.enabled {
@@ -404,6 +402,9 @@ func (b *Bridge) SetupEventSubscriptions() {
 		b.latestCtxMu.Lock()
 		b.latestCtx[jugglerSessionID] = ev.ExecutionContextID
 		b.latestCtxMu.Unlock()
+		b.ctxMapMu.Lock()
+		b.ctxUniqueOwners[ev.ExecutionContextID] = cdpSessionID
+		b.ctxMapMu.Unlock()
 
 		cdpFrameID := b.cdpFrameIDForJugglerSession(jugglerSessionID, ev.AuxData.FrameID)
 
@@ -437,12 +438,16 @@ func (b *Bridge) SetupEventSubscriptions() {
 				b.ctxOwners[isoCtxID] = cdpSessionID
 				b.ctxMapMu.Unlock()
 
+				uniqueID := fmt.Sprintf("isolated-%s-%s", frameID, w.WorldName)
+				b.ctxMapMu.Lock()
+				b.ctxUniqueOwners[uniqueID] = cdpSessionID
+				b.ctxMapMu.Unlock()
 				b.emitEvent("Runtime.executionContextCreated", map[string]interface{}{
 					"context": map[string]interface{}{
 						"id":       isoCtxID,
 						"origin":   "",
 						"name":     w.WorldName,
-						"uniqueId": fmt.Sprintf("isolated-%s-%s", frameID, w.WorldName),
+						"uniqueId": uniqueID,
 						"auxData": map[string]interface{}{
 							"isDefault": false,
 							"type":      "isolated",

@@ -72,6 +72,10 @@ func (b *Bridge) handleRuntime(conn *cdp.Connection, msg *cdp.Message) (json.Raw
 			return nil, &cdp.Error{Code: -32602, Message: "invalid params"}
 		}
 
+		if !b.uniqueContextOwned(msg.SessionID, params.UniqueContextID) {
+			return nil, &cdp.Error{Code: -32000, Message: "execution context not found"}
+		}
+
 		// Map CDP contextId (numeric) to Juggler executionContextId (string)
 		if params.ContextID > 0 && !b.contextOwned(msg.SessionID, params.ContextID) {
 			return nil, &cdp.Error{Code: -32000, Message: "execution context not found"}
@@ -133,6 +137,9 @@ func (b *Bridge) handleRuntime(conn *cdp.Connection, msg *cdp.Message) (json.Raw
 		}
 		if err := json.Unmarshal(msg.Params, &params); err != nil {
 			return nil, &cdp.Error{Code: -32602, Message: "invalid params"}
+		}
+		if !b.uniqueContextOwned(msg.SessionID, params.UniqueContextID) {
+			return nil, &cdp.Error{Code: -32000, Message: "execution context not found"}
 		}
 		if params.ObjectID != "" {
 			b.nodeObjectsMu.RLock()

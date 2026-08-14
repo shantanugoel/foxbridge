@@ -21,10 +21,11 @@ type Bridge struct {
 	autoAttach *autoAttachState
 	ownership  *ownershipRegistry
 	// ctxMap maps numeric CDP execution context IDs to Juggler execution context ID strings
-	ctxMapMu   sync.RWMutex
-	ctxMap     map[int]string // cdpContextID → jugglerContextID
-	ctxOwners  map[int]string // cdpContextID → owning CDP session
-	ctxCounter int            // monotonic counter for execution context IDs
+	ctxMapMu        sync.RWMutex
+	ctxMap          map[int]string    // cdpContextID → jugglerContextID
+	ctxOwners       map[int]string    // cdpContextID → owning CDP session
+	ctxUniqueOwners map[string]string // unique context ID → owning CDP session
+	ctxCounter      int               // monotonic counter for execution context IDs
 	// loaderMap tracks the last loaderId per CDP session for lifecycle event consistency
 	loaderMapMu sync.RWMutex
 	loaderMap   map[string]string // cdpSessionID → last loaderId
@@ -96,6 +97,7 @@ func New(b backend.Backend, sessions *cdp.SessionManager, server *cdp.Server, is
 		autoAttach:           newAutoAttachState(),
 		ctxMap:               make(map[int]string),
 		ctxOwners:            make(map[int]string),
+		ctxUniqueOwners:      make(map[string]string),
 		ctxCounter:           100,
 		loaderMap:            make(map[string]string),
 		latestCtx:            make(map[string]string),
@@ -263,6 +265,11 @@ func (b *Bridge) clearConnectionState(records []*targetRecord) {
 			if jugglerID == record.jugglerSessionID || b.ctxOwners[id] == record.pageSessionID {
 				delete(b.ctxMap, id)
 				delete(b.ctxOwners, id)
+			}
+		}
+		for uniqueID, owner := range b.ctxUniqueOwners {
+			if owner == record.pageSessionID {
+				delete(b.ctxUniqueOwners, uniqueID)
 			}
 		}
 		b.ctxMapMu.Unlock()
@@ -439,6 +446,16 @@ func (b *Bridge) nextCtxID() int {
 func (b *Bridge) contextOwned(sessionID string, contextID int) bool {
 	b.ctxMapMu.RLock()
 	owner, known := b.ctxOwners[contextID]
+	b.ctxMapMu.RUnlock()
+	return !known || owner == sessionID
+}
+
+func (b *Bridge) uniqueContextOwned(sessionID, uniqueID string) bool {
+	if uniqueID == "" {
+		return true
+	}
+	b.ctxMapMu.RLock()
+	owner, known := b.ctxUniqueOwners[uniqueID]
 	b.ctxMapMu.RUnlock()
 	return !known || owner == sessionID
 }
