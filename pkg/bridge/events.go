@@ -799,7 +799,6 @@ func (b *Bridge) SetupEventSubscriptions() {
 			"timestamp":         0,
 			"encodedDataLength": 0,
 		}, cdpSessionID)
-		b.ownership.clearRequest(ev.RequestID)
 	})
 
 	// Network.requestFailed → Network.loadingFailed

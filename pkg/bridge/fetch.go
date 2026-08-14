@@ -380,6 +380,7 @@ func (b *Bridge) handleFetch(conn *cdp.Connection, msg *cdp.Message) (json.RawMe
 				"body":          string(decoded),
 				"base64Encoded": false,
 			})
+			b.ownership.clearRequest(params.RequestID)
 			return resp, nil
 		}
 
@@ -388,6 +389,7 @@ func (b *Bridge) handleFetch(conn *cdp.Connection, msg *cdp.Message) (json.RawMe
 			"body":          jugglerResult.Base64Body,
 			"base64Encoded": true,
 		})
+		b.ownership.clearRequest(params.RequestID)
 		return resp, nil
 
 	case "Fetch.continueResponse":
