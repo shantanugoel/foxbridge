@@ -206,6 +206,9 @@ func (b *Bridge) authorize(conn *cdp.Connection, msg *cdp.Message) *cdp.Error {
 	if msg.SessionID != "" && !b.ownership.sessionOwned(conn, msg.SessionID) {
 		return &cdp.Error{Code: -32000, Message: "session not found"}
 	}
+	if msg.Method == "Browser.close" {
+		return &cdp.Error{Code: -32000, Message: "browser close is disabled in ownership mode"}
+	}
 	if msg.SessionID != "" && targetScopedMethod(msg.Method) && b.ownership.isBrowserSession(msg.SessionID) {
 		return &cdp.Error{Code: -32000, Message: "page session required"}
 	}
@@ -296,6 +299,7 @@ func (b *Bridge) clearConnectionState(records []*targetRecord) {
 			}
 		}
 		b.pdfStreamsMu.Unlock()
+		b.ownership.clearRequests(record.pageSessionID)
 
 		b.autoAttach.mu.Lock()
 		delete(b.autoAttach.pendingFrameIDs, record.jugglerSessionID)
@@ -345,6 +349,13 @@ func (b *Bridge) closeRecord(record *targetRecord, closeBackend bool) {
 	b.autoAttach.pending = pending
 	b.autoAttach.mu.Unlock()
 	b.ownership.remove(record)
+}
+
+func (b *Bridge) authorizeRequest(sessionID, requestID string) *cdp.Error {
+	if !b.ownership.requestOwned(sessionID, requestID) {
+		return &cdp.Error{Code: -32000, Message: "request not found"}
+	}
+	return nil
 }
 
 func (b *Bridge) disableFetchIfUnused() {

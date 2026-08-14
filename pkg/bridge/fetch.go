@@ -84,6 +84,16 @@ func (b *Bridge) fetchInterceptionEnabled() bool {
 	return enabled
 }
 
+func (b *Bridge) fetchEnabledForSession(sessionID string) bool {
+	b.fetchPatternsMu.RLock()
+	_, enabled := b.fetchPatterns[sessionID]
+	if !enabled && sessionID != "" {
+		_, enabled = b.fetchPatterns[""]
+	}
+	b.fetchPatternsMu.RUnlock()
+	return enabled
+}
+
 func (b *Bridge) shouldPauseFetchRequest(sessionID, url, resourceType, requestStage string) bool {
 	b.fetchPatternsMu.RLock()
 	patterns, enabled := b.fetchPatterns[sessionID]
@@ -143,6 +153,14 @@ func (b *Bridge) continueFetchRequest(sessionID, requestID string) error {
 }
 
 func (b *Bridge) handleFetch(conn *cdp.Connection, msg *cdp.Message) (json.RawMessage, *cdp.Error) {
+	if conn != nil && msg.Method != "Fetch.enable" && msg.Method != "Fetch.disable" {
+		var params struct {
+			RequestID string `json:"requestId"`
+		}
+		if err := json.Unmarshal(msg.Params, &params); err != nil || !b.ownership.requestOwned(msg.SessionID, params.RequestID) {
+			return nil, &cdp.Error{Code: -32000, Message: "request not found"}
+		}
+	}
 	switch msg.Method {
 	case "Fetch.enable":
 		var params struct {

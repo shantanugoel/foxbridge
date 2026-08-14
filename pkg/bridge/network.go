@@ -167,6 +167,11 @@ func (b *Bridge) handleNetwork(conn *cdp.Connection, msg *cdp.Message) (json.Raw
 		if err := json.Unmarshal(msg.Params, &params); err != nil {
 			return nil, &cdp.Error{Code: -32602, Message: "invalid params"}
 		}
+		if conn != nil {
+			if err := b.authorizeRequest(msg.SessionID, params.RequestID); err != nil {
+				return nil, err
+			}
+		}
 
 		result, err := b.callJuggler("", "Browser.getResponseBody", map[string]string{
 			"requestId": params.RequestID,

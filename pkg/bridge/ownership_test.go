@@ -91,3 +91,21 @@ func TestOwnershipCancelsLateAttachAfterDisconnect(t *testing.T) {
 		t.Fatal("late backend attach was not cancelled")
 	}
 }
+
+func TestOwnershipRequestIDsAreScoped(t *testing.T) {
+	r := newOwnershipRegistry()
+	if r.requestOwned("session-a", "request-1") {
+		t.Fatal("unknown request should not be owned")
+	}
+	r.setRequestOwner("request-1", "session-a")
+	if !r.requestOwned("session-a", "request-1") {
+		t.Fatal("request owner was not recorded")
+	}
+	if r.requestOwned("session-b", "request-1") {
+		t.Fatal("foreign session owns request")
+	}
+	r.clearRequest("request-1")
+	if r.requestOwned("session-a", "request-1") {
+		t.Fatal("cleared request remains owned")
+	}
+}

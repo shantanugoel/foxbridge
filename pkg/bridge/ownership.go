@@ -51,6 +51,7 @@ type ownershipRegistry struct {
 	pending          map[uint64]*pendingCreate
 	claims           map[string]*pendingCreate
 	cancelledTargets map[string]bool
+	requestOwners    map[string]string // backend request ID → CDP session ID
 }
 
 func newOwnershipRegistry() *ownershipRegistry {
@@ -62,6 +63,7 @@ func newOwnershipRegistry() *ownershipRegistry {
 		pending:          make(map[uint64]*pendingCreate),
 		claims:           make(map[string]*pendingCreate),
 		cancelledTargets: make(map[string]bool),
+		requestOwners:    make(map[string]string),
 	}
 }
 
@@ -353,6 +355,44 @@ func (r *ownershipRegistry) cancelTarget(targetID string) *targetRecord {
 		return record
 	}
 	return nil
+}
+
+func (r *ownershipRegistry) setRequestOwner(requestID, sessionID string) {
+	if requestID == "" || sessionID == "" {
+		return
+	}
+	r.mu.Lock()
+	r.requestOwners[requestID] = sessionID
+	r.mu.Unlock()
+}
+
+func (r *ownershipRegistry) requestOwned(sessionID, requestID string) bool {
+	if requestID == "" || sessionID == "" {
+		return false
+	}
+	r.mu.Lock()
+	owner, known := r.requestOwners[requestID]
+	r.mu.Unlock()
+	return known && owner == sessionID
+}
+
+func (r *ownershipRegistry) clearRequest(requestID string) {
+	if requestID == "" {
+		return
+	}
+	r.mu.Lock()
+	delete(r.requestOwners, requestID)
+	r.mu.Unlock()
+}
+
+func (r *ownershipRegistry) clearRequests(sessionID string) {
+	r.mu.Lock()
+	for requestID, owner := range r.requestOwners {
+		if owner == sessionID {
+			delete(r.requestOwners, requestID)
+		}
+	}
+	r.mu.Unlock()
 }
 
 func (r *ownershipRegistry) connectionClosedLocked(conn *cdp.Connection) bool {

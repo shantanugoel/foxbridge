@@ -159,7 +159,7 @@ func (b *Bridge) SetupEventSubscriptions() {
 			Type:             "tab",
 		})
 
-		record := b.ownership.registerPair(nil, pair)
+		record := b.ownership.registerPair(b.ownership.ownerForTarget(ev.TargetInfo.OpenerID), pair)
 		b.autoAttach.mu.Lock()
 		b.autoAttach.pairs[jugglerSessionID] = pair
 		b.autoAttach.mu.Unlock()
@@ -655,6 +655,9 @@ func (b *Bridge) SetupEventSubscriptions() {
 		}
 
 		cdpSessionID := b.resolveCDPSession(jugglerSessionID)
+		if cdpSessionID != "" {
+			b.ownership.setRequestOwner(ev.RequestID, cdpSessionID)
+		}
 		cdpFrameID := b.cdpFrameIDForJugglerSession(jugglerSessionID, ev.FrameID)
 
 		cdpHeaders := map[string]string{}
@@ -701,6 +704,14 @@ func (b *Bridge) SetupEventSubscriptions() {
 		}, cdpSessionID)
 
 		if ev.IsIntercepted {
+			if !b.fetchEnabledForSession(cdpSessionID) {
+				go func() {
+					if err := b.continueFetchRequest(cdpSessionID, ev.RequestID); err != nil {
+						log.Printf("events: failed to continue request for disabled Fetch session: %v", err)
+					}
+				}()
+				return
+			}
 			if !b.shouldPauseFetchRequest(cdpSessionID, ev.URL, resourceType, "Request") {
 				// Backend event handlers run on Juggler's read loop. Continue in a
 				// goroutine so the read loop can receive the command response.
@@ -788,6 +799,7 @@ func (b *Bridge) SetupEventSubscriptions() {
 			"timestamp":         0,
 			"encodedDataLength": 0,
 		}, cdpSessionID)
+		b.ownership.clearRequest(ev.RequestID)
 	})
 
 	// Network.requestFailed → Network.loadingFailed
@@ -807,6 +819,7 @@ func (b *Bridge) SetupEventSubscriptions() {
 			"errorText": ev.ErrorCode,
 			"canceled":  false,
 		}, cdpSessionID)
+		b.ownership.clearRequest(ev.RequestID)
 	})
 
 	// WebSocket events → Network.webSocket* CDP events
