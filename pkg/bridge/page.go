@@ -704,6 +704,7 @@ func (b *Bridge) handlePage(conn *cdp.Connection, msg *cdp.Message) (json.RawMes
 		streamHandle := fmt.Sprintf("pdf-stream-%d", time.Now().UnixNano())
 		b.pdfStreamsMu.Lock()
 		b.pdfStreams[streamHandle] = pdfResult.Data
+		b.pdfOwners[streamHandle] = msg.SessionID
 		b.pdfStreamsMu.Unlock()
 
 		return marshalResult(map[string]interface{}{

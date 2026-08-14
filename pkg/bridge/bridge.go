@@ -37,6 +37,7 @@ type Bridge struct {
 	// nodeObjects maps backendNodeId → objectId for DOM.describeNode/resolveNode round-trips
 	nodeObjectsMu sync.RWMutex
 	nodeObjects   map[int]string // backendNodeId → objectId
+	nodeOwners    map[int]string // backendNodeId → owning CDP session
 	// lastQuerySelector tracks the last intercepted CSS selector per session
 	// so we can combine querySelector + userFn into a single evaluate for $eval
 	lastQueryMu    sync.RWMutex
@@ -49,6 +50,7 @@ type Bridge struct {
 	// pdfStreams stores PDF data for IO.read streaming
 	pdfStreamsMu sync.Mutex
 	pdfStreams   map[string]string // streamHandle → base64 data
+	pdfOwners    map[string]string // streamHandle → owning CDP session
 	// pendingContextClear tracks sessions that had executionContextsCleared.
 	// The next executionContextCreated should trigger isolated world re-emission.
 	pendingContextClearMu sync.Mutex
@@ -99,11 +101,13 @@ func New(b backend.Backend, sessions *cdp.SessionManager, server *cdp.Server, is
 		latestCtx:            make(map[string]string),
 		isolatedWorlds:       make(map[string][]isolatedWorldInfo),
 		nodeObjects:          make(map[int]string),
+		nodeOwners:           make(map[int]string),
 		lastQuery:            make(map[string]string),
 		lastQueryAll:         make(map[string]bool),
 		lastQuerySkips:       make(map[string]int),
 		lastDialog:           make(map[string]string),
 		pdfStreams:           make(map[string]string),
+		pdfOwners:            make(map[string]string),
 		pendingContextClear:  make(map[string]bool),
 		fetchPatterns:        make(map[string][]fetchRequestPattern),
 		deterministicApplied: make(map[string]bool),
@@ -261,6 +265,24 @@ func (b *Bridge) clearConnectionState(records []*targetRecord) {
 			}
 		}
 		b.ctxMapMu.Unlock()
+
+		b.nodeObjectsMu.Lock()
+		for id, owner := range b.nodeOwners {
+			if owner == record.pageSessionID {
+				delete(b.nodeOwners, id)
+				delete(b.nodeObjects, id)
+			}
+		}
+		b.nodeObjectsMu.Unlock()
+
+		b.pdfStreamsMu.Lock()
+		for handle, owner := range b.pdfOwners {
+			if owner == record.pageSessionID {
+				delete(b.pdfOwners, handle)
+				delete(b.pdfStreams, handle)
+			}
+		}
+		b.pdfStreamsMu.Unlock()
 
 		b.autoAttach.mu.Lock()
 		delete(b.autoAttach.pendingFrameIDs, record.jugglerSessionID)

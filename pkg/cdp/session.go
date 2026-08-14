@@ -32,7 +32,19 @@ func NewSessionManager() *SessionManager {
 }
 
 // Add registers a new session.
+func cloneSessionInfo(info *SessionInfo) *SessionInfo {
+	if info == nil {
+		return nil
+	}
+	copy := *info
+	return &copy
+}
+
 func (sm *SessionManager) Add(info *SessionInfo) {
+	if info == nil {
+		return
+	}
+	info = cloneSessionInfo(info)
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 	sm.sessions[info.SessionID] = info
@@ -60,7 +72,7 @@ func (sm *SessionManager) Get(sessionID string) (*SessionInfo, bool) {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
 	info, ok := sm.sessions[sessionID]
-	return info, ok
+	return cloneSessionInfo(info), ok
 }
 
 // GetByTarget returns session info by target ID.
@@ -68,7 +80,7 @@ func (sm *SessionManager) GetByTarget(targetID string) (*SessionInfo, bool) {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
 	info, ok := sm.targets[targetID]
-	return info, ok
+	return cloneSessionInfo(info), ok
 }
 
 // GetByJugglerSession returns session info by Juggler session ID.
@@ -76,7 +88,7 @@ func (sm *SessionManager) GetByJugglerSession(jugglerSessionID string) (*Session
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
 	info, ok := sm.jugglerSessions[jugglerSessionID]
-	return info, ok
+	return cloneSessionInfo(info), ok
 }
 
 // GetByFrameID returns the first page session matching the given frame ID.
@@ -85,7 +97,7 @@ func (sm *SessionManager) GetByFrameID(frameID string) (*SessionInfo, bool) {
 	defer sm.mu.RUnlock()
 	for _, info := range sm.sessions {
 		if info.FrameID == frameID && info.Type == "page" {
-			return info, true
+			return cloneSessionInfo(info), true
 		}
 	}
 	return nil, false
@@ -97,9 +109,33 @@ func (sm *SessionManager) All() []*SessionInfo {
 	defer sm.mu.RUnlock()
 	result := make([]*SessionInfo, 0, len(sm.sessions))
 	for _, info := range sm.sessions {
-		result = append(result, info)
+		result = append(result, cloneSessionInfo(info))
 	}
 	return result
+}
+
+func (sm *SessionManager) UpdateURL(sessionID, url string) {
+	sm.mu.Lock()
+	if info := sm.sessions[sessionID]; info != nil {
+		info.URL = url
+	}
+	sm.mu.Unlock()
+}
+
+func (sm *SessionManager) SetFrameIDIfEmpty(sessionID, frameID string) {
+	sm.mu.Lock()
+	if info := sm.sessions[sessionID]; info != nil && info.FrameID == "" {
+		info.FrameID = frameID
+	}
+	sm.mu.Unlock()
+}
+
+func (sm *SessionManager) SetFrameID(sessionID, frameID string) {
+	sm.mu.Lock()
+	if info := sm.sessions[sessionID]; info != nil {
+		info.FrameID = frameID
+	}
+	sm.mu.Unlock()
 }
 
 // GetBrowserContexts returns unique browser context IDs from all sessions.

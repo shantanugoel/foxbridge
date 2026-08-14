@@ -199,6 +199,7 @@ func (b *Bridge) handleDOM(conn *cdp.Connection, msg *cdp.Message) (json.RawMess
 		if params.ObjectID != "" {
 			b.nodeObjectsMu.Lock()
 			b.nodeObjects[params.BackendNodeID] = params.ObjectID
+			b.nodeOwners[params.BackendNodeID] = msg.SessionID
 			b.nodeObjectsMu.Unlock()
 		}
 
@@ -379,7 +380,11 @@ func (b *Bridge) handleDOM(conn *cdp.Connection, msg *cdp.Message) (json.RawMess
 		// This ensures resolveNode returns the SAME element, not just `document`.
 		b.nodeObjectsMu.RLock()
 		storedObjectID := b.nodeObjects[params.BackendNodeID]
+		storedOwner := b.nodeOwners[params.BackendNodeID]
 		b.nodeObjectsMu.RUnlock()
+		if storedOwner != "" && storedOwner != msg.SessionID {
+			return nil, &cdp.Error{Code: -32000, Message: "node not found"}
+		}
 
 		if storedObjectID != "" {
 			return marshalResult(map[string]interface{}{

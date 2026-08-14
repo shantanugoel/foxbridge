@@ -21,7 +21,11 @@ func (b *Bridge) handleIO(conn *cdp.Connection, msg *cdp.Message) (json.RawMessa
 
 		b.pdfStreamsMu.Lock()
 		data, ok := b.pdfStreams[params.Handle]
+		owner := b.pdfOwners[params.Handle]
 		b.pdfStreamsMu.Unlock()
+		if owner != "" && owner != msg.SessionID {
+			return nil, &cdp.Error{Code: -32000, Message: "stream not found: " + params.Handle}
+		}
 
 		if !ok {
 			return nil, &cdp.Error{Code: -32000, Message: "stream not found: " + params.Handle}
@@ -43,7 +47,13 @@ func (b *Bridge) handleIO(conn *cdp.Connection, msg *cdp.Message) (json.RawMessa
 		}
 
 		b.pdfStreamsMu.Lock()
+		owner := b.pdfOwners[params.Handle]
+		if owner != "" && owner != msg.SessionID {
+			b.pdfStreamsMu.Unlock()
+			return nil, &cdp.Error{Code: -32000, Message: "stream not found: " + params.Handle}
+		}
 		delete(b.pdfStreams, params.Handle)
+		delete(b.pdfOwners, params.Handle)
 		b.pdfStreamsMu.Unlock()
 
 		return json.RawMessage(`{}`), nil

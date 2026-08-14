@@ -245,7 +245,7 @@ func (b *Bridge) SetupEventSubscriptions() {
 
 		// Update session URL
 		if info, ok := b.sessions.GetByJugglerSession(jugglerSessionID); ok {
-			info.URL = ev.URL
+			b.sessions.UpdateURL(info.SessionID, ev.URL)
 		}
 		b.autoAttach.mu.Lock()
 		if pair, ok := b.autoAttach.pairs[jugglerSessionID]; ok {
@@ -380,7 +380,7 @@ func (b *Bridge) SetupEventSubscriptions() {
 		// Store frame ID if not already set
 		if ev.AuxData.FrameID != "" {
 			if info, ok := b.sessions.GetByJugglerSession(jugglerSessionID); ok && info.FrameID == "" {
-				info.FrameID = ev.AuxData.FrameID
+				b.sessions.SetFrameIDIfEmpty(info.SessionID, ev.AuxData.FrameID)
 				log.Printf("[event] stored frameID=%s for juggler session %s", ev.AuxData.FrameID, jugglerSessionID)
 			} else if !ok {
 				// Session not registered yet — buffer the frameId for later
@@ -551,7 +551,7 @@ func (b *Bridge) SetupEventSubscriptions() {
 		// Store the main frame ID (parentFrameId is empty for the main frame)
 		if ev.ParentFrameID == "" && ev.FrameID != "" {
 			if info, ok := b.sessions.GetByJugglerSession(jugglerSessionID); ok {
-				info.FrameID = ev.FrameID
+				b.sessions.SetFrameID(info.SessionID, ev.FrameID)
 			}
 		}
 
@@ -915,6 +915,9 @@ func (b *Bridge) SetupEventSubscriptions() {
 		}
 
 		cdpSessionID := b.resolveCDPSession(jugglerSessionID)
+		if cdpSessionID != "" && b.ownership.sessionOwner(cdpSessionID) == nil {
+			cdpSessionID = ""
+		}
 
 		// Browser.requestIntercepted is a browser-level event (no juggler session ID).
 		// Resolve the CDP session from the frameId so Puppeteer receives it on the page session.

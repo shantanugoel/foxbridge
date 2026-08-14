@@ -324,6 +324,7 @@ func (b *Bridge) handleRuntime(conn *cdp.Connection, msg *cdp.Message) (json.Raw
 						backendID := b.nextCtxID()
 						b.nodeObjectsMu.Lock()
 						b.nodeObjects[backendID] = evalResult.Result.ObjectID
+						b.nodeOwners[backendID] = msg.SessionID
 						b.nodeObjectsMu.Unlock()
 					}
 					return normalizeRuntimeResult(result), nil
