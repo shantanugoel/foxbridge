@@ -211,10 +211,10 @@ func (b *Bridge) authorize(conn *cdp.Connection, msg *cdp.Message) *cdp.Error {
 // ConnectionClosed releases all pages owned by a disconnected CDP client.
 func (b *Bridge) ConnectionClosed(conn *cdp.Connection) {
 	records := b.ownership.closeConnection(conn)
-	b.clearConnectionState(records)
 	for _, record := range records {
 		b.closeRecord(record, true)
 	}
+	b.disableFetchIfUnused()
 }
 
 func (b *Bridge) clearConnectionState(records []*targetRecord) {
@@ -286,6 +286,8 @@ func (b *Bridge) closeRecord(record *targetRecord, closeBackend bool) {
 			log.Printf("[ownership] close target %s: %v", record.pageTargetID, err)
 		}
 	}
+	b.clearConnectionState([]*targetRecord{record})
+	b.disableFetchIfUnused()
 	b.sendOwnedEvent(owner, "Target.detachedFromTarget", map[string]interface{}{
 		"sessionId": record.pageSessionID,
 		"targetId":  record.pageTargetID,
@@ -308,6 +310,15 @@ func (b *Bridge) closeRecord(record *targetRecord, closeBackend bool) {
 	b.autoAttach.pending = pending
 	b.autoAttach.mu.Unlock()
 	b.ownership.remove(record)
+}
+
+func (b *Bridge) disableFetchIfUnused() {
+	if b.fetchInterceptionEnabled() {
+		return
+	}
+	if _, err := b.callJuggler("", "Browser.setRequestInterception", map[string]interface{}{"enabled": false}); err != nil {
+		log.Printf("[ownership] disable request interception: %v", err)
+	}
 }
 
 func (b *Bridge) sendOwnedEvent(owner *cdp.Connection, method string, params interface{}, sessionID string) {
