@@ -174,7 +174,18 @@ func (p *Process) Stop() error {
 	defer p.mu.Unlock()
 
 	if p.client != nil {
-		p.client.Call("", "Browser.close", nil)
+		// Juggler may terminate Firefox without replying to Browser.close. Do not
+		// leave a container supervisor blocked for the normal 30-second RPC timeout.
+		client := p.client
+		closeDone := make(chan struct{})
+		go func() {
+			_, _ = client.Call("", "Browser.close", nil)
+			close(closeDone)
+		}()
+		select {
+		case <-closeDone:
+		case <-time.After(2 * time.Second):
+		}
 		p.client.Close()
 		p.client = nil
 	}
