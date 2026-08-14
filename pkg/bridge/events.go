@@ -926,6 +926,9 @@ func (b *Bridge) SetupEventSubscriptions() {
 				cdpSessionID = session
 			}
 		}
+		if cdpSessionID != "" && b.ownership.sessionOwner(cdpSessionID) == nil {
+			cdpSessionID = ""
+		}
 
 		if cdpSessionID == "" {
 			go func() {
@@ -1011,23 +1014,6 @@ func (b *Bridge) SetupEventSubscriptions() {
 			"resourceType": resourceType,
 		}, cdpSessionID)
 	})
-}
-
-// emitTabAttach emits the tab-level attachment on the browser session.
-func (b *Bridge) emitTabAttach(pair *targetPair) {
-	b.emitEvent("Target.attachedToTarget", map[string]interface{}{
-		"sessionId": pair.tabSessionID,
-		"targetInfo": map[string]interface{}{
-			"targetId":         pair.tabTargetID,
-			"type":             "tab",
-			"title":            "",
-			"url":              pair.url,
-			"attached":         true,
-			"canAccessOpener":  false,
-			"browserContextId": pair.browserCtxID,
-		},
-		"waitingForDebugger": true,
-	}, "")
 }
 
 func (b *Bridge) emitAutoAttachPair(pair *targetPair) {

@@ -134,6 +134,14 @@ func (b *Bridge) handleRuntime(conn *cdp.Connection, msg *cdp.Message) (json.Raw
 		if err := json.Unmarshal(msg.Params, &params); err != nil {
 			return nil, &cdp.Error{Code: -32602, Message: "invalid params"}
 		}
+		if params.ObjectID != "" {
+			b.nodeObjectsMu.RLock()
+			owner := b.objectOwners[params.ObjectID]
+			b.nodeObjectsMu.RUnlock()
+			if owner != "" && owner != msg.SessionID {
+				return nil, &cdp.Error{Code: -32000, Message: "object not found"}
+			}
+		}
 
 		// Map CDP contextId to Juggler executionContextId
 		if params.ExecutionContextID > 0 && !b.contextOwned(msg.SessionID, params.ExecutionContextID) {
@@ -325,6 +333,7 @@ func (b *Bridge) handleRuntime(conn *cdp.Connection, msg *cdp.Message) (json.Raw
 						b.nodeObjectsMu.Lock()
 						b.nodeObjects[backendID] = evalResult.Result.ObjectID
 						b.nodeOwners[backendID] = msg.SessionID
+						b.objectOwners[evalResult.Result.ObjectID] = msg.SessionID
 						b.nodeObjectsMu.Unlock()
 					}
 					return normalizeRuntimeResult(result), nil
@@ -418,6 +427,12 @@ func (b *Bridge) handleRuntime(conn *cdp.Connection, msg *cdp.Message) (json.Raw
 		// Skip releasing dummy/empty object IDs (from our $eval interception)
 		if params.ObjectID == "" {
 			return json.RawMessage(`{}`), nil
+		}
+		b.nodeObjectsMu.RLock()
+		objectOwner := b.objectOwners[params.ObjectID]
+		b.nodeObjectsMu.RUnlock()
+		if objectOwner != "" && objectOwner != msg.SessionID {
+			return nil, &cdp.Error{Code: -32000, Message: "object not found"}
 		}
 
 		// Skip releasing objectIds stored in nodeObjects — these are element handles

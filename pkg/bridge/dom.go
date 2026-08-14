@@ -200,6 +200,7 @@ func (b *Bridge) handleDOM(conn *cdp.Connection, msg *cdp.Message) (json.RawMess
 			b.nodeObjectsMu.Lock()
 			b.nodeObjects[params.BackendNodeID] = params.ObjectID
 			b.nodeOwners[params.BackendNodeID] = msg.SessionID
+			b.objectOwners[params.ObjectID] = msg.SessionID
 			b.nodeObjectsMu.Unlock()
 		}
 

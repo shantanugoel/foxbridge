@@ -36,8 +36,9 @@ type Bridge struct {
 	isolatedWorlds   map[string][]isolatedWorldInfo // cdpSessionID → list of isolated worlds
 	// nodeObjects maps backendNodeId → objectId for DOM.describeNode/resolveNode round-trips
 	nodeObjectsMu sync.RWMutex
-	nodeObjects   map[int]string // backendNodeId → objectId
-	nodeOwners    map[int]string // backendNodeId → owning CDP session
+	nodeObjects   map[int]string    // backendNodeId → objectId
+	nodeOwners    map[int]string    // backendNodeId → owning CDP session
+	objectOwners  map[string]string // objectId → owning CDP session
 	// lastQuerySelector tracks the last intercepted CSS selector per session
 	// so we can combine querySelector + userFn into a single evaluate for $eval
 	lastQueryMu    sync.RWMutex
@@ -87,7 +88,6 @@ func (b *Bridge) setJugglerBrowserContext(params map[string]interface{}, id stri
 // New creates a new Bridge. Set isBiDi to true when using the BiDi backend.
 func New(b backend.Backend, sessions *cdp.SessionManager, server *cdp.Server, isBiDi ...bool) *Bridge {
 	bidi := len(isBiDi) > 0 && isBiDi[0]
-	_ = bidi
 	bridge := &Bridge{
 		backend:              b,
 		isBiDi:               bidi,
@@ -102,6 +102,7 @@ func New(b backend.Backend, sessions *cdp.SessionManager, server *cdp.Server, is
 		isolatedWorlds:       make(map[string][]isolatedWorldInfo),
 		nodeObjects:          make(map[int]string),
 		nodeOwners:           make(map[int]string),
+		objectOwners:         make(map[string]string),
 		lastQuery:            make(map[string]string),
 		lastQueryAll:         make(map[string]bool),
 		lastQuerySkips:       make(map[string]int),
@@ -271,6 +272,11 @@ func (b *Bridge) clearConnectionState(records []*targetRecord) {
 			if owner == record.pageSessionID {
 				delete(b.nodeOwners, id)
 				delete(b.nodeObjects, id)
+			}
+		}
+		for objectID, owner := range b.objectOwners {
+			if owner == record.pageSessionID {
+				delete(b.objectOwners, objectID)
 			}
 		}
 		b.nodeObjectsMu.Unlock()

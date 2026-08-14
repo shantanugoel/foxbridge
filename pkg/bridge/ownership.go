@@ -48,7 +48,6 @@ type ownershipRegistry struct {
 	targets          map[string]*targetRecord
 	sessions         map[string]*targetRecord
 	browserSessions  map[string]*cdp.Connection
-	juggler          map[string]*targetRecord
 	pending          map[uint64]*pendingCreate
 	claims           map[string]*pendingCreate
 	cancelledTargets map[string]bool
@@ -60,7 +59,6 @@ func newOwnershipRegistry() *ownershipRegistry {
 		targets:          make(map[string]*targetRecord),
 		sessions:         make(map[string]*targetRecord),
 		browserSessions:  make(map[string]*cdp.Connection),
-		juggler:          make(map[string]*targetRecord),
 		pending:          make(map[uint64]*pendingCreate),
 		claims:           make(map[string]*pendingCreate),
 		cancelledTargets: make(map[string]bool),
@@ -225,7 +223,6 @@ func (r *ownershipRegistry) registerPair(owner *cdp.Connection, pair *targetPair
 	} else if cancelled {
 		owner = nil
 	}
-	r.nextGeneration++
 	record := &targetRecord{
 		pageTargetID:     pair.pageTargetID,
 		tabTargetID:      pair.tabTargetID,
@@ -244,9 +241,6 @@ func (r *ownershipRegistry) registerPair(owner *cdp.Connection, pair *targetPair
 	r.targets[pair.tabTargetID] = record
 	r.sessions[pair.pageSessionID] = record
 	r.sessions[pair.tabSessionID] = record
-	if pair.jugglerSessionID != "" {
-		r.juggler[pair.jugglerSessionID] = record
-	}
 	return record
 }
 
@@ -265,7 +259,6 @@ func (r *ownershipRegistry) registerWorker(owner *cdp.Connection, targetID, sess
 	} else if cancelled {
 		owner = nil
 	}
-	r.nextGeneration++
 	record := &targetRecord{
 		pageTargetID:     targetID,
 		pageSessionID:    sessionID,
@@ -279,9 +272,6 @@ func (r *ownershipRegistry) registerWorker(owner *cdp.Connection, targetID, sess
 	}
 	r.targets[targetID] = record
 	r.sessions[sessionID] = record
-	if jugglerSessionID != "" {
-		r.juggler[jugglerSessionID] = record
-	}
 	return record
 }
 
@@ -422,9 +412,6 @@ func (r *ownershipRegistry) remove(record *targetRecord) {
 	}
 	if record.tabSessionID != "" && r.sessions[record.tabSessionID] == record {
 		delete(r.sessions, record.tabSessionID)
-	}
-	if record.jugglerSessionID != "" && r.juggler[record.jugglerSessionID] == record {
-		delete(r.juggler, record.jugglerSessionID)
 	}
 	record.state = targetClosed
 }
