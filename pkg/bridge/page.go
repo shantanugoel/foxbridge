@@ -731,6 +731,9 @@ func (b *Bridge) handlePage(conn *cdp.Connection, msg *cdp.Message) (json.RawMes
 		return json.RawMessage(`{}`), nil
 
 	case "Page.setExtraHTTPHeaders":
+		if conn != nil {
+			return nil, &cdp.Error{Code: -32000, Message: "shared browser-global setting is disabled"}
+		}
 		var params struct {
 			Headers map[string]string `json:"headers"`
 		}
@@ -828,6 +831,9 @@ func (b *Bridge) handlePage(conn *cdp.Connection, msg *cdp.Message) (json.RawMes
 		return b.handleDOM(conn, msg)
 
 	case "Page.setDownloadBehavior":
+		if conn != nil {
+			return nil, &cdp.Error{Code: -32000, Message: "shared browser-global setting is disabled"}
+		}
 		var params struct {
 			Behavior     string `json:"behavior"` // "deny", "allow", "allowAndName", "default"
 			DownloadPath string `json:"downloadPath"`

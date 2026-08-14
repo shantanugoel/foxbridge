@@ -63,6 +63,9 @@ func (b *Bridge) handleStub(conn *cdp.Connection, msg *cdp.Message) (json.RawMes
 
 	// Browser.grantPermissions
 	if method == "Browser.grantPermissions" {
+		if conn != nil {
+			return nil, &cdp.Error{Code: -32000, Message: "shared browser-global setting is disabled"}
+		}
 		// Forward to Juggler if supported, otherwise no-op
 		_, _ = b.callJuggler("", "Browser.grantPermissions", msg.Params)
 		return mustMarshal(map[string]interface{}{}), nil
