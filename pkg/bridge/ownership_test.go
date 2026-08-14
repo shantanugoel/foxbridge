@@ -21,7 +21,7 @@ func TestOwnershipClaimBeforeAttach(t *testing.T) {
 		tabSessionID:     "tab-session-1",
 		jugglerSessionID: "juggler-1",
 	})
-	if record.owner != owner {
+	if owner, _, _ := r.recordDetails(record); owner == nil {
 		t.Fatal("backend attach did not inherit create owner")
 	}
 	if r.ownerForTarget("tab-1") != owner {
@@ -74,5 +74,20 @@ func TestOwnershipCloseConnectionIsIdempotent(t *testing.T) {
 	}
 	if r.ownerForTarget("page-1") != nil {
 		t.Fatal("closed connection still owns target")
+	}
+}
+
+func TestOwnershipCancelsLateAttachAfterDisconnect(t *testing.T) {
+	r := newOwnershipRegistry()
+	owner := &cdp.Connection{}
+	generation := r.beginCreate(owner)
+	r.closeConnection(owner)
+	if record := r.claimTarget(owner, "late-page", generation); record != nil {
+		t.Fatal("late claim should not own an existing target")
+	}
+	record := r.registerPair(nil, &targetPair{pageTargetID: "late-page", pageSessionID: "late-session"})
+	_, _, cancelled := r.recordDetails(record)
+	if !cancelled {
+		t.Fatal("late backend attach was not cancelled")
 	}
 }

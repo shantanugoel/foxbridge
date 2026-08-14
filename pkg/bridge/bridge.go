@@ -160,19 +160,6 @@ func (b *Bridge) HandleMessage(conn *cdp.Connection, msg *cdp.Message) {
 		result, cdpErr = b.handleStub(conn, msg)
 	}
 
-	resp := &cdp.Message{
-		ID:        msg.ID,
-		SessionID: msg.SessionID,
-	}
-	if cdpErr != nil {
-		resp.Error = cdpErr
-	} else {
-		if result == nil {
-			result = json.RawMessage(`{}`)
-		}
-		resp.Result = result
-	}
-
 	b.sendResponse(conn, msg, result, cdpErr)
 }
 
@@ -210,6 +197,9 @@ func (b *Bridge) authorize(conn *cdp.Connection, msg *cdp.Message) *cdp.Error {
 	if msg.SessionID != "" && !b.ownership.sessionOwned(conn, msg.SessionID) {
 		return &cdp.Error{Code: -32000, Message: "session not found"}
 	}
+	if msg.SessionID != "" && targetScopedMethod(msg.Method) && b.ownership.isBrowserSession(msg.SessionID) {
+		return &cdp.Error{Code: -32000, Message: "page session required"}
+	}
 	if msg.SessionID == "" && targetScopedMethod(msg.Method) {
 		return &cdp.Error{Code: -32000, Message: "target session required"}
 	}
@@ -218,8 +208,61 @@ func (b *Bridge) authorize(conn *cdp.Connection, msg *cdp.Message) *cdp.Error {
 
 // ConnectionClosed releases all pages owned by a disconnected CDP client.
 func (b *Bridge) ConnectionClosed(conn *cdp.Connection) {
-	for _, record := range b.ownership.closeConnection(conn) {
+	records := b.ownership.closeConnection(conn)
+	b.clearConnectionState(records)
+	for _, record := range records {
 		b.closeRecord(record, true)
+	}
+}
+
+func (b *Bridge) clearConnectionState(records []*targetRecord) {
+	for _, record := range records {
+		b.loaderMapMu.Lock()
+		delete(b.loaderMap, record.pageSessionID)
+		b.loaderMapMu.Unlock()
+
+		b.isolatedWorldsMu.Lock()
+		delete(b.isolatedWorlds, record.pageSessionID)
+		b.isolatedWorldsMu.Unlock()
+
+		b.lastQueryMu.Lock()
+		delete(b.lastQuery, record.pageSessionID)
+		delete(b.lastQueryAll, record.pageSessionID)
+		delete(b.lastQuerySkips, record.pageSessionID)
+		b.lastQueryMu.Unlock()
+
+		b.lastDialogMu.Lock()
+		delete(b.lastDialog, record.pageSessionID)
+		b.lastDialogMu.Unlock()
+
+		b.fetchPatternsMu.Lock()
+		delete(b.fetchPatterns, record.pageSessionID)
+		b.fetchPatternsMu.Unlock()
+
+		b.pendingContextClearMu.Lock()
+		delete(b.pendingContextClear, record.pageSessionID)
+		b.pendingContextClearMu.Unlock()
+
+		b.deterministicMu.Lock()
+		delete(b.deterministicApplied, record.pageSessionID)
+		b.deterministicMu.Unlock()
+
+		b.latestCtxMu.Lock()
+		delete(b.latestCtx, record.jugglerSessionID)
+		b.latestCtxMu.Unlock()
+
+		b.ctxMapMu.Lock()
+		for id, jugglerID := range b.ctxMap {
+			if jugglerID == record.jugglerSessionID {
+				delete(b.ctxMap, id)
+			}
+		}
+		b.ctxMapMu.Unlock()
+
+		b.autoAttach.mu.Lock()
+		delete(b.autoAttach.pendingFrameIDs, record.jugglerSessionID)
+		delete(b.autoAttach.pairs, record.jugglerSessionID)
+		b.autoAttach.mu.Unlock()
 	}
 }
 
@@ -258,15 +301,21 @@ func (b *Bridge) closeRecord(record *targetRecord, closeBackend bool) {
 
 func (b *Bridge) publishOwnedPair(pair *targetPair) {
 	record := b.ownership.recordForTarget(pair.pageTargetID)
-	if record == nil || record.owner == nil {
+	if record == nil {
 		return
 	}
-	if b.ownership.discoverEnabled(record.owner) {
+	owner, _, cancelled := b.ownership.recordDetails(record)
+	if owner == nil || cancelled {
+		return
+	}
+	if b.ownership.discoverEnabled(owner) {
+		b.autoAttach.mu.Lock()
 		url := pair.url
+		b.autoAttach.mu.Unlock()
 		if url == "" {
 			url = "about:blank"
 		}
-		_ = b.server.Send(record.owner, &cdp.Message{
+		_ = b.server.Send(owner, &cdp.Message{
 			Method: "Target.targetCreated",
 			Params: mustJSON(map[string]interface{}{"targetInfo": map[string]interface{}{
 				"targetId": pair.pageTargetID, "type": "page", "title": "", "url": url,
@@ -274,7 +323,7 @@ func (b *Bridge) publishOwnedPair(pair *targetPair) {
 			}}),
 		})
 	}
-	if b.ownership.autoAttachEnabled(record.owner) {
+	if b.ownership.autoAttachEnabled(owner) {
 		b.emitAutoAttachPair(pair)
 	}
 }

@@ -30,11 +30,6 @@ func (b *Bridge) handleTarget(conn *cdp.Connection, msg *cdp.Message) (json.RawM
 			if info.Type == "tab" || !b.ownedTarget(conn, info.TargetID) {
 				continue
 			}
-			// Flat CDP clients consume page targets directly. Advertising the
-			// synthetic tab as well makes them wait for a redundant child attach.
-			if info.Type == "tab" {
-				continue
-			}
 			url := info.URL
 			if url == "" && info.Type == "page" {
 				url = "about:blank"
@@ -140,8 +135,25 @@ func (b *Bridge) handleTarget(conn *cdp.Connection, msg *cdp.Message) (json.RawM
 			targetID = uuid.New().String()
 		}
 
-		if record := b.ownership.claimTarget(conn, targetID, generation); record != nil && record.owner == conn && record.pair != nil {
-			b.publishOwnedPair(record.pair)
+		record := b.ownership.claimTarget(conn, targetID, generation)
+		if b.ownership.connectionClosed(conn) {
+			if record == nil {
+				record = b.ownership.cancelTarget(targetID)
+			}
+			if record != nil {
+				b.closeRecord(record, true)
+			}
+			return nil, &cdp.Error{Code: -32000, Message: "connection closed"}
+		}
+		if record != nil {
+			recordOwner, pair, cancelled := b.ownership.recordDetails(record)
+			if cancelled {
+				b.closeRecord(record, true)
+				return nil, &cdp.Error{Code: -32000, Message: "connection closed"}
+			}
+			if recordOwner == conn && pair != nil {
+				b.publishOwnedPair(pair)
+			}
 		}
 
 		if params.URL != "" && params.URL != "about:blank" {
@@ -149,6 +161,9 @@ func (b *Bridge) handleTarget(conn *cdp.Connection, msg *cdp.Message) (json.RawM
 				b.applyDeterministicPrelude(cdpSessionID)
 			}
 			if err := b.navigateNewTarget(targetID, params.URL); err != nil {
+				if record := b.ownership.cancelTarget(targetID); record != nil {
+					b.closeRecord(record, true)
+				}
 				return nil, &cdp.Error{Code: -32000, Message: err.Error()}
 			}
 		}

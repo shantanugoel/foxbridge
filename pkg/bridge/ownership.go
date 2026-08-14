@@ -24,9 +24,9 @@ type targetRecord struct {
 	jugglerSessionID string
 	owner            *cdp.Connection
 	state            targetLifecycle
-	generation       uint64
 	pair             *targetPair
 	cleaned          bool
+	cancelled        bool
 }
 
 type connectionState struct {
@@ -43,25 +43,27 @@ type pendingCreate struct {
 type ownershipRegistry struct {
 	mu sync.Mutex
 
-	nextGeneration  uint64
-	connections     map[*cdp.Connection]*connectionState
-	targets         map[string]*targetRecord
-	sessions        map[string]*targetRecord
-	browserSessions map[string]*cdp.Connection
-	juggler         map[string]*targetRecord
-	pending         map[uint64]*pendingCreate
-	claims          map[string]*pendingCreate
+	nextGeneration   uint64
+	connections      map[*cdp.Connection]*connectionState
+	targets          map[string]*targetRecord
+	sessions         map[string]*targetRecord
+	browserSessions  map[string]*cdp.Connection
+	juggler          map[string]*targetRecord
+	pending          map[uint64]*pendingCreate
+	claims           map[string]*pendingCreate
+	cancelledTargets map[string]bool
 }
 
 func newOwnershipRegistry() *ownershipRegistry {
 	return &ownershipRegistry{
-		connections:     make(map[*cdp.Connection]*connectionState),
-		targets:         make(map[string]*targetRecord),
-		sessions:        make(map[string]*targetRecord),
-		browserSessions: make(map[string]*cdp.Connection),
-		juggler:         make(map[string]*targetRecord),
-		pending:         make(map[uint64]*pendingCreate),
-		claims:          make(map[string]*pendingCreate),
+		connections:      make(map[*cdp.Connection]*connectionState),
+		targets:          make(map[string]*targetRecord),
+		sessions:         make(map[string]*targetRecord),
+		browserSessions:  make(map[string]*cdp.Connection),
+		juggler:          make(map[string]*targetRecord),
+		pending:          make(map[uint64]*pendingCreate),
+		claims:           make(map[string]*pendingCreate),
+		cancelledTargets: make(map[string]bool),
 	}
 }
 
@@ -111,6 +113,15 @@ func (r *ownershipRegistry) setAutoAttach(conn *cdp.Connection, enabled bool) {
 	r.mu.Unlock()
 }
 
+func (r *ownershipRegistry) connectionClosed(conn *cdp.Connection) bool {
+	if conn == nil {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.connectionClosedLocked(conn)
+}
+
 func (r *ownershipRegistry) autoAttachEnabled(conn *cdp.Connection) bool {
 	if conn == nil {
 		return false
@@ -124,6 +135,9 @@ func (r *ownershipRegistry) autoAttachEnabled(conn *cdp.Connection) bool {
 func (r *ownershipRegistry) beginCreate(conn *cdp.Connection) uint64 {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if conn != nil {
+		r.stateLocked(conn)
+	}
 	r.nextGeneration++
 	claim := &pendingCreate{owner: conn, generation: r.nextGeneration}
 	r.pending[claim.generation] = claim
@@ -148,15 +162,22 @@ func (r *ownershipRegistry) claimTarget(conn *cdp.Connection, targetID string, g
 	if claim == nil {
 		claim = &pendingCreate{owner: conn, generation: generation}
 	}
+	cancelled := r.connectionClosedLocked(claim.owner)
 	if record := r.targets[targetID]; record != nil {
-		if record.owner == nil && record.state == targetOpen {
+		if cancelled {
+			record.cancelled = true
+			record.state = targetClosing
+		} else if record.owner == nil && record.state == targetOpen {
 			record.owner = claim.owner
-			r.indexConnectionLocked(record)
-			return record
+			r.stateLocked(record.owner)
 		}
 		return record
 	}
-	r.claims[targetID] = claim
+	if cancelled {
+		r.cancelledTargets[targetID] = true
+	} else {
+		r.claims[targetID] = claim
+	}
 	return nil
 }
 
@@ -192,12 +213,17 @@ func (r *ownershipRegistry) sessionOwned(conn *cdp.Connection, sessionID string)
 func (r *ownershipRegistry) registerPair(owner *cdp.Connection, pair *targetPair) *targetRecord {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	cancelled := r.cancelledTargets[pair.pageTargetID]
 	if claim := r.claims[pair.pageTargetID]; claim != nil {
 		owner = claim.owner
+		cancelled = r.connectionClosedLocked(owner)
 		delete(r.claims, pair.pageTargetID)
 	}
-	if owner != nil {
+	delete(r.cancelledTargets, pair.pageTargetID)
+	if owner != nil && !cancelled {
 		r.stateLocked(owner)
+	} else if cancelled {
+		owner = nil
 	}
 	r.nextGeneration++
 	record := &targetRecord{
@@ -208,8 +234,11 @@ func (r *ownershipRegistry) registerPair(owner *cdp.Connection, pair *targetPair
 		jugglerSessionID: pair.jugglerSessionID,
 		owner:            owner,
 		state:            targetOpen,
-		generation:       r.nextGeneration,
 		pair:             pair,
+		cancelled:        cancelled,
+	}
+	if cancelled {
+		record.state = targetClosing
 	}
 	r.targets[pair.pageTargetID] = record
 	r.targets[pair.tabTargetID] = record
@@ -224,12 +253,17 @@ func (r *ownershipRegistry) registerPair(owner *cdp.Connection, pair *targetPair
 func (r *ownershipRegistry) registerWorker(owner *cdp.Connection, targetID, sessionID, jugglerSessionID string) *targetRecord {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	cancelled := r.cancelledTargets[targetID]
 	if claim := r.claims[targetID]; claim != nil {
 		owner = claim.owner
+		cancelled = r.connectionClosedLocked(owner)
 		delete(r.claims, targetID)
 	}
-	if owner != nil {
+	delete(r.cancelledTargets, targetID)
+	if owner != nil && !cancelled {
 		r.stateLocked(owner)
+	} else if cancelled {
+		owner = nil
 	}
 	r.nextGeneration++
 	record := &targetRecord{
@@ -238,7 +272,10 @@ func (r *ownershipRegistry) registerWorker(owner *cdp.Connection, targetID, sess
 		jugglerSessionID: jugglerSessionID,
 		owner:            owner,
 		state:            targetOpen,
-		generation:       r.nextGeneration,
+		cancelled:        cancelled,
+	}
+	if cancelled {
+		record.state = targetClosing
 	}
 	r.targets[targetID] = record
 	r.sessions[sessionID] = record
@@ -277,16 +314,38 @@ func (r *ownershipRegistry) sessionOwner(sessionID string) *cdp.Connection {
 	return nil
 }
 
-func (r *ownershipRegistry) removeBrowserSession(sessionID string) {
+func (r *ownershipRegistry) isBrowserSession(sessionID string) bool {
 	r.mu.Lock()
-	delete(r.browserSessions, sessionID)
+	_, ok := r.browserSessions[sessionID]
 	r.mu.Unlock()
+	return ok
 }
 
-func (r *ownershipRegistry) indexConnectionLocked(record *targetRecord) {
-	if record.owner != nil {
-		r.stateLocked(record.owner)
+func (r *ownershipRegistry) recordDetails(record *targetRecord) (*cdp.Connection, *targetPair, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if record == nil {
+		return nil, nil, false
 	}
+	return record.owner, record.pair, record.cancelled
+}
+
+func (r *ownershipRegistry) cancelTarget(targetID string) *targetRecord {
+	if targetID == "" {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if claim := r.claims[targetID]; claim != nil {
+		delete(r.claims, targetID)
+	}
+	r.cancelledTargets[targetID] = true
+	if record := r.targets[targetID]; record != nil {
+		record.cancelled = true
+		record.state = targetClosing
+		return record
+	}
+	return nil
 }
 
 func (r *ownershipRegistry) connectionClosedLocked(conn *cdp.Connection) bool {
@@ -366,6 +425,22 @@ func (r *ownershipRegistry) closeConnection(conn *cdp.Connection) []*targetRecor
 		return nil
 	}
 	state.closed = true
+	for generation, claim := range r.pending {
+		if claim.owner == conn {
+			delete(r.pending, generation)
+		}
+	}
+	for targetID, claim := range r.claims {
+		if claim.owner == conn {
+			delete(r.claims, targetID)
+			r.cancelledTargets[targetID] = true
+		}
+	}
+	for sessionID, owner := range r.browserSessions {
+		if owner == conn {
+			delete(r.browserSessions, sessionID)
+		}
+	}
 	var records []*targetRecord
 	seen := make(map[*targetRecord]bool)
 	for _, record := range r.targets {
@@ -377,24 +452,4 @@ func (r *ownershipRegistry) closeConnection(conn *cdp.Connection) []*targetRecor
 		}
 	}
 	return records
-}
-
-func (r *ownershipRegistry) connectionForSession(sessionID string) *cdp.Connection {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	record := r.sessions[sessionID]
-	if record == nil || record.state == targetClosed || r.connectionClosedLocked(record.owner) {
-		return nil
-	}
-	return record.owner
-}
-
-func (r *ownershipRegistry) targetForSession(sessionID string) string {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	record := r.sessions[sessionID]
-	if record == nil {
-		return ""
-	}
-	return record.pageTargetID
 }

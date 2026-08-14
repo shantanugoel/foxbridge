@@ -56,7 +56,7 @@ func (b *Bridge) SetupEventSubscriptions() {
 				BrowserContextID string `json:"browserContextId"`
 				Type             string `json:"type"`
 				URL              string `json:"url"`
-				OpenerId         string `json:"openerId"`
+				OpenerID         string `json:"openerId"`
 			} `json:"targetInfo"`
 		}
 		if err := json.Unmarshal(params, &ev); err != nil {
@@ -83,12 +83,20 @@ func (b *Bridge) SetupEventSubscriptions() {
 
 			log.Printf("[event] registered %s target=%s session=%s", targetType, targetID, workerSessionID)
 
-			record := b.ownership.registerWorker(nil, targetID, workerSessionID, jugglerSessionID)
+			owner := b.ownership.ownerForTarget(ev.TargetInfo.OpenerID)
+			record := b.ownership.registerWorker(owner, targetID, workerSessionID, jugglerSessionID)
+			recordOwner, _, _ := b.ownership.recordDetails(record)
+			b.autoAttach.mu.Lock()
 			autoEnabled := b.autoAttach.enabled
-			if record.owner != nil {
-				autoEnabled = b.ownership.autoAttachEnabled(record.owner)
+			b.autoAttach.mu.Unlock()
+			if recordOwner != nil {
+				autoEnabled = b.ownership.autoAttachEnabled(recordOwner)
 			}
 
+			if _, _, cancelled := b.ownership.recordDetails(record); cancelled {
+				b.closeRecord(record, true)
+				return
+			}
 			if autoEnabled {
 				b.emitEvent("Target.attachedToTarget", map[string]interface{}{
 					"sessionId": workerSessionID,
@@ -155,8 +163,13 @@ func (b *Bridge) SetupEventSubscriptions() {
 		b.autoAttach.mu.Lock()
 		b.autoAttach.pairs[jugglerSessionID] = pair
 		b.autoAttach.mu.Unlock()
-		if record.owner != nil {
-			if b.ownership.autoAttachEnabled(record.owner) {
+		recordOwner, _, cancelled := b.ownership.recordDetails(record)
+		if cancelled {
+			b.closeRecord(record, true)
+			return
+		}
+		if recordOwner != nil {
+			if b.ownership.autoAttachEnabled(recordOwner) {
 				b.publishOwnedPair(pair)
 			}
 		} else {
@@ -1047,7 +1060,9 @@ func (b *Bridge) emitPageAttachOnSession(pair *targetPair, parentSessionID strin
 	}
 	b.autoAttach.mu.Unlock()
 
+	b.autoAttach.mu.Lock()
 	url := pair.url
+	b.autoAttach.mu.Unlock()
 	if url == "" {
 		url = "about:blank"
 	}
