@@ -3,7 +3,9 @@ package bridge
 import (
 	"encoding/base64"
 	"encoding/json"
+	"regexp"
 	"testing"
+	"time"
 
 	"github.com/VulpineOS/foxbridge/pkg/cdp"
 )
@@ -37,6 +39,134 @@ func TestFetchEnable(t *testing.T) {
 	json.Unmarshal(last.Params, &params)
 	if params["enabled"] != true {
 		t.Errorf("enabled = %v, want true", params["enabled"])
+	}
+}
+
+func TestFetchEnableStoresPatterns(t *testing.T) {
+	b, _ := newTestBridge()
+
+	msg := &cdp.Message{
+		ID:        1,
+		Method:    "Fetch.enable",
+		SessionID: "s1",
+		Params: json.RawMessage(`{
+			"patterns": [{
+				"urlPattern": "http://hermes-dialog-bridge.invalid/*",
+				"resourceType": "XHR",
+				"requestStage": "Request"
+			}]
+		}`),
+	}
+
+	if _, cdpErr := b.handleFetch(nil, msg); cdpErr != nil {
+		t.Fatalf("unexpected error: %s", cdpErr.Message)
+	}
+
+	if !b.shouldPauseFetchRequest("s1", "http://hermes-dialog-bridge.invalid/?kind=alert", "XHR", "Request") {
+		t.Error("matching dialog bridge request should be paused")
+	}
+	if b.shouldPauseFetchRequest("s1", "https://github.com/", "Document", "Request") {
+		t.Error("non-matching navigation should not be paused")
+	}
+}
+
+func TestFetchPatternsMatchCDPWildcards(t *testing.T) {
+	b, _ := newTestBridge()
+	patterns, err := compileFetchPatterns([]json.RawMessage{
+		json.RawMessage(`{"urlPattern":"https://*.example.com/file?.js","requestStage":"Request"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.setFetchPatterns("s1", patterns)
+
+	if !b.shouldPauseFetchRequest("s1", "https://cdn.example.com/file1.js", "Script", "Request") {
+		t.Error("expected wildcard pattern to match")
+	}
+	if b.shouldPauseFetchRequest("s1", "https://cdn.example.com/file12.js", "Script", "Request") {
+		t.Error("? must match exactly one character")
+	}
+	if b.shouldPauseFetchRequest("s1", "https://cdn.example.com/file1.js", "Script", "Response") {
+		t.Error("request-stage pattern must not match a response-stage event")
+	}
+}
+
+func TestFetchEnableWithoutPatternsMatchesAll(t *testing.T) {
+	b, _ := newTestBridge()
+	b.setFetchPatterns("s1", nil)
+
+	if !b.shouldPauseFetchRequest("s1", "https://example.com/", "Document", "Request") {
+		t.Error("Fetch.enable without patterns should pause every request")
+	}
+}
+
+func TestNetworkRequestContinuesNonMatchingFetchPattern(t *testing.T) {
+	b, mb := newTestBridge()
+	b.sessions.Add(&cdp.SessionInfo{
+		SessionID:        "cdp-s1",
+		JugglerSessionID: "jug-s1",
+		TargetID:         "target-1",
+		FrameID:          "frame-1",
+		Type:             "page",
+	})
+	patterns, err := compileFetchPatterns([]json.RawMessage{
+		json.RawMessage(`{"urlPattern":"http://hermes-dialog-bridge.invalid/*"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.setFetchPatterns("cdp-s1", patterns)
+	b.SetupEventSubscriptions()
+
+	mb.mu.Lock()
+	handler := mb.handlers["Network.requestWillBeSent"][0]
+	mb.mu.Unlock()
+	handler("jug-s1", json.RawMessage(`{
+		"requestId":"request-1",
+		"url":"https://github.com/",
+		"method":"GET",
+		"headers":[],
+		"frameId":"frame-1",
+		"navigationId":"navigation-1",
+		"isIntercepted":true,
+		"cause":"TYPE_DOCUMENT",
+		"internalCause":"TYPE_DOCUMENT"
+	}`))
+
+	var calls []mockCall
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		calls = mb.CallsForMethod("Network.resumeInterceptedRequest")
+		if len(calls) > 0 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if len(calls) != 1 {
+		t.Fatalf("continue calls = %d, want 1", len(calls))
+	}
+	var params map[string]interface{}
+	if err := json.Unmarshal(calls[0].Params, &params); err != nil {
+		t.Fatal(err)
+	}
+	if params["requestId"] != "request-1" {
+		t.Errorf("requestId = %v, want request-1", params["requestId"])
+	}
+}
+
+func TestFetchDisableClearsPatterns(t *testing.T) {
+	b, _ := newTestBridge()
+	b.setFetchPatterns("s1", []fetchRequestPattern{{
+		URLPattern: "https://only.example/*",
+		urlRegexp:  regexp.MustCompile(`^https://only\.example/.*$`),
+	}})
+
+	msg := &cdp.Message{ID: 1, Method: "Fetch.disable", SessionID: "s1"}
+	if _, cdpErr := b.handleFetch(nil, msg); cdpErr != nil {
+		t.Fatalf("unexpected error: %s", cdpErr.Message)
+	}
+	if !b.shouldPauseFetchRequest("s1", "https://other.example/", "Document", "Request") {
+		t.Error("disabled Fetch state must not filter interception requested elsewhere")
 	}
 }
 
@@ -146,8 +276,8 @@ func TestFetchContinueRequest_HeaderConversion(t *testing.T) {
 	}
 
 	last, _ := mb.LastCall()
-	if last.Method != "Browser.continueInterceptedRequest" {
-		t.Errorf("method = %q, want Browser.continueInterceptedRequest", last.Method)
+	if last.Method != "Network.resumeInterceptedRequest" {
+		t.Errorf("method = %q, want Network.resumeInterceptedRequest", last.Method)
 	}
 
 	var params map[string]interface{}
@@ -168,6 +298,37 @@ func TestFetchContinueRequest_HeaderConversion(t *testing.T) {
 	h0 := headers[0].(map[string]interface{})
 	if h0["name"] != "Content-Type" || h0["value"] != "application/json" {
 		t.Errorf("header[0] = %v, want Content-Type: application/json", h0)
+	}
+}
+
+func TestFetchContinueRequestUsesJugglerPageSession(t *testing.T) {
+	b, mb := newTestBridge()
+	b.sessions.Add(&cdp.SessionInfo{
+		SessionID:        "cdp-s1",
+		JugglerSessionID: "jug-s1",
+		TargetID:         "target-1",
+		Type:             "page",
+	})
+
+	msg := &cdp.Message{
+		ID:        1,
+		Method:    "Fetch.continueRequest",
+		SessionID: "cdp-s1",
+		Params:    json.RawMessage(`{"requestId":"request-1"}`),
+	}
+	if _, cdpErr := b.handleFetch(nil, msg); cdpErr != nil {
+		t.Fatalf("unexpected error: %s", cdpErr.Message)
+	}
+
+	last, err := mb.LastCall()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if last.Method != "Network.resumeInterceptedRequest" {
+		t.Errorf("method = %q, want Network.resumeInterceptedRequest", last.Method)
+	}
+	if last.SessionID != "jug-s1" {
+		t.Errorf("session = %q, want jug-s1", last.SessionID)
 	}
 }
 
@@ -276,8 +437,8 @@ func TestFetchFulfillRequest(t *testing.T) {
 	}
 
 	last, _ := mb.LastCall()
-	if last.Method != "Browser.fulfillInterceptedRequest" {
-		t.Errorf("method = %q, want Browser.fulfillInterceptedRequest", last.Method)
+	if last.Method != "Network.fulfillInterceptedRequest" {
+		t.Errorf("method = %q, want Network.fulfillInterceptedRequest", last.Method)
 	}
 
 	var params map[string]interface{}
@@ -292,8 +453,8 @@ func TestFetchFulfillRequest(t *testing.T) {
 	if params["statusText"] != "OK" {
 		t.Errorf("statusText = %v, want OK", params["statusText"])
 	}
-	if params["body"] != "PGh0bWw+PC9odG1sPg==" {
-		t.Errorf("body = %v, want PGh0bWw+PC9odG1sPg==", params["body"])
+	if params["base64body"] != "PGh0bWw+PC9odG1sPg==" {
+		t.Errorf("base64body = %v, want PGh0bWw+PC9odG1sPg==", params["base64body"])
 	}
 }
 
@@ -413,8 +574,8 @@ func TestFetchFailRequest_AllErrorReasons(t *testing.T) {
 			}
 
 			last, _ := mb.LastCall()
-			if last.Method != "Browser.abortInterceptedRequest" {
-				t.Errorf("method = %q, want Browser.abortInterceptedRequest", last.Method)
+			if last.Method != "Network.abortInterceptedRequest" {
+				t.Errorf("method = %q, want Network.abortInterceptedRequest", last.Method)
 			}
 
 			var p map[string]interface{}
@@ -459,7 +620,7 @@ func TestFetchGetResponseBody_Base64(t *testing.T) {
 	b64 := base64.StdEncoding.EncodeToString(binaryData)
 
 	resp, _ := json.Marshal(map[string]string{"base64body": b64})
-	mb.SetResponse("", "Browser.getResponseBody", resp, nil)
+	mb.SetResponse("", "Network.getResponseBody", resp, nil)
 
 	msg := &cdp.Message{
 		ID:     1,
@@ -493,7 +654,7 @@ func TestFetchGetResponseBody_UTF8Text(t *testing.T) {
 	b64 := base64.StdEncoding.EncodeToString([]byte(textData))
 
 	resp, _ := json.Marshal(map[string]string{"base64body": b64})
-	mb.SetResponse("", "Browser.getResponseBody", resp, nil)
+	mb.SetResponse("", "Network.getResponseBody", resp, nil)
 
 	msg := &cdp.Message{
 		ID:     1,

@@ -126,12 +126,12 @@ The tables below describe the major domains foxbridge actively handles today. Th
 |--------|---------------|
 | `enable` | `Browser.setRequestInterception` |
 | `disable` | `Browser.setRequestInterception(false)` |
-| `continueRequest` | `Browser.continueInterceptedRequest` |
-| `fulfillRequest` | `Browser.fulfillInterceptedRequest` |
-| `failRequest` | `Browser.abortInterceptedRequest` |
-| `getResponseBody` | `Browser.getResponseBody` |
+| `continueRequest` | `Network.resumeInterceptedRequest` |
+| `fulfillRequest` | `Network.fulfillInterceptedRequest` |
+| `failRequest` | `Network.abortInterceptedRequest` |
+| `getResponseBody` | `Network.getResponseBody` |
 | `continueWithAuth` | `Browser.handleAuthRequest` |
-| `continueResponse` | `Browser.continueInterceptedRequest` |
+| `continueResponse` | `Network.resumeInterceptedRequest` |
 
 ### Emulation
 

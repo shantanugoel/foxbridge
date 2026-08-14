@@ -51,6 +51,11 @@ type Bridge struct {
 	// The next executionContextCreated should trigger isolated world re-emission.
 	pendingContextClearMu sync.Mutex
 	pendingContextClear   map[string]bool // cdpSessionID → true
+	// fetchPatterns retains the CDP-side Fetch.enable filters. Juggler only
+	// supports enabling interception for an entire browser context, so the
+	// bridge must continue requests that do not match these patterns itself.
+	fetchPatternsMu sync.RWMutex
+	fetchPatterns   map[string][]fetchRequestPattern // cdpSessionID → patterns
 	// deterministicScript is injected into page sessions when deterministic mode is enabled.
 	deterministicMu      sync.RWMutex
 	deterministicScript  string
@@ -97,6 +102,7 @@ func New(b backend.Backend, sessions *cdp.SessionManager, server *cdp.Server, is
 		lastDialog:           make(map[string]string),
 		pdfStreams:           make(map[string]string),
 		pendingContextClear:  make(map[string]bool),
+		fetchPatterns:        make(map[string][]fetchRequestPattern),
 		deterministicApplied: make(map[string]bool),
 	}
 }

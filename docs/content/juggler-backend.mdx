@@ -88,11 +88,13 @@ CDP includes an `id` field in each touch point. Juggler rejects touch events wit
 
 ## Request Interception
 
-Juggler handles request interception at the browser level, not the page level. The flow:
+Juggler enables request interception at browser-context level and handles each
+paused request on its page-scoped `Network` domain. The flow:
 
 1. `Fetch.enable` on a page session → foxbridge resolves `browserContextId` from the session and calls `Browser.setRequestInterception({enabled: true, browserContextId})`
-2. Juggler emits `Browser.requestIntercepted` (browser event, no session) → foxbridge matches the `frameId` to a CDP page session and emits `Fetch.requestPaused` on that session
-3. `Fetch.continueRequest` / `Fetch.fulfillRequest` / `Fetch.failRequest` → translated to `Browser.continueInterceptedRequest` / `Browser.fulfillInterceptedRequest` / `Browser.abortInterceptedRequest`
+2. Juggler emits `Network.requestWillBeSent` with `isIntercepted: true` on the page session → foxbridge emits `Fetch.requestPaused` on the corresponding CDP session
+3. Requests excluded by the CDP `Fetch.enable` patterns are resumed automatically through `Network.resumeInterceptedRequest`
+4. `Fetch.continueRequest` / `Fetch.fulfillRequest` / `Fetch.failRequest` → translated to `Network.resumeInterceptedRequest` / `Network.fulfillInterceptedRequest` / `Network.abortInterceptedRequest` on the Juggler page session
 
 ## awaitPromise Support
 

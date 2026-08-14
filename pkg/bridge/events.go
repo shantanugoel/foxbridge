@@ -652,13 +652,17 @@ func (b *Bridge) SetupEventSubscriptions() {
 	// Network.requestWillBeSent → Network.requestWillBeSent
 	b.backend.Subscribe("Network.requestWillBeSent", func(jugglerSessionID string, params json.RawMessage) {
 		var ev struct {
-			RequestID    string            `json:"requestId"`
-			FrameID      string            `json:"frameId"`
-			URL          string            `json:"url"`
-			Method       string            `json:"method"`
-			Headers      map[string]string `json:"headers"`
-			IsNavigation bool              `json:"isNavigationRequest"`
-			RedirectURL  string            `json:"redirectedFrom"`
+			RequestID     string        `json:"requestId"`
+			FrameID       string        `json:"frameId"`
+			URL           string        `json:"url"`
+			Method        string        `json:"method"`
+			Headers       []headerEntry `json:"headers"`
+			PostData      string        `json:"postData"`
+			IsIntercepted bool          `json:"isIntercepted"`
+			IsNavigation  bool          `json:"isNavigationRequest"`
+			NavigationID  string        `json:"navigationId"`
+			Cause         string        `json:"cause"`
+			RedirectURL   string        `json:"redirectedFrom"`
 		}
 		if err := json.Unmarshal(params, &ev); err != nil {
 			return
@@ -668,8 +672,8 @@ func (b *Bridge) SetupEventSubscriptions() {
 		cdpFrameID := b.cdpFrameIDForJugglerSession(jugglerSessionID, ev.FrameID)
 
 		cdpHeaders := map[string]string{}
-		for k, v := range ev.Headers {
-			cdpHeaders[k] = v
+		for _, header := range ev.Headers {
+			cdpHeaders[header.Name] = header.Value
 		}
 
 		// Detect WebSocket connections from URL scheme
@@ -686,7 +690,7 @@ func (b *Bridge) SetupEventSubscriptions() {
 		resourceType := "Document"
 		if isWebSocket {
 			resourceType = "WebSocket"
-		} else if !ev.IsNavigation {
+		} else if !ev.IsNavigation && ev.NavigationID == "" {
 			resourceType = "Other"
 		}
 
@@ -709,6 +713,37 @@ func (b *Bridge) SetupEventSubscriptions() {
 			"type":    resourceType,
 			"frameId": cdpFrameID,
 		}, cdpSessionID)
+
+		if ev.IsIntercepted {
+			if !b.shouldPauseFetchRequest(cdpSessionID, ev.URL, resourceType, "Request") {
+				// Backend event handlers run on Juggler's read loop. Continue in a
+				// goroutine so the read loop can receive the command response.
+				go func() {
+					if err := b.continueFetchRequest(cdpSessionID, ev.RequestID); err != nil {
+						log.Printf("events: failed to continue request excluded by Fetch patterns: %v", err)
+					}
+				}()
+				return
+			}
+
+			request := map[string]interface{}{
+				"url":             ev.URL,
+				"method":          ev.Method,
+				"headers":         cdpHeaders,
+				"initialPriority": "High",
+				"referrerPolicy":  "strict-origin-when-cross-origin",
+			}
+			if ev.PostData != "" {
+				request["postData"] = ev.PostData
+			}
+			b.emitEvent("Fetch.requestPaused", map[string]interface{}{
+				"requestId":    ev.RequestID,
+				"networkId":    ev.RequestID,
+				"request":      request,
+				"frameId":      cdpFrameID,
+				"resourceType": resourceType,
+			}, cdpSessionID)
+		}
 	})
 
 	// Network.responseReceived → Network.responseReceived
@@ -935,6 +970,15 @@ func (b *Bridge) SetupEventSubscriptions() {
 			if ev.IsNavigationRequest {
 				resourceType = "Document"
 			}
+		}
+
+		if !b.shouldPauseFetchRequest(cdpSessionID, url, resourceType, "Request") {
+			go func() {
+				if err := b.continueFetchRequest(cdpSessionID, ev.RequestID); err != nil {
+					log.Printf("events: failed to continue request excluded by Fetch patterns: %v", err)
+				}
+			}()
+			return
 		}
 
 		cdpFrameID := ev.FrameID

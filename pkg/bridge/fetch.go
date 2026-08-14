@@ -4,9 +4,131 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"regexp"
+	"strings"
 
 	"github.com/VulpineOS/foxbridge/pkg/cdp"
 )
+
+type fetchRequestPattern struct {
+	URLPattern   string `json:"urlPattern"`
+	ResourceType string `json:"resourceType"`
+	RequestStage string `json:"requestStage"`
+
+	urlRegexp *regexp.Regexp
+}
+
+func compileFetchPatterns(raw []json.RawMessage) ([]fetchRequestPattern, error) {
+	patterns := make([]fetchRequestPattern, 0, len(raw))
+	for _, value := range raw {
+		var pattern fetchRequestPattern
+		if err := json.Unmarshal(value, &pattern); err != nil {
+			return nil, err
+		}
+		if pattern.URLPattern == "" {
+			pattern.URLPattern = "*"
+		}
+		re, err := regexp.Compile(cdpURLPatternRegexp(pattern.URLPattern))
+		if err != nil {
+			return nil, err
+		}
+		pattern.urlRegexp = re
+		patterns = append(patterns, pattern)
+	}
+	return patterns, nil
+}
+
+// cdpURLPatternRegexp converts the simple wildcard syntax used by CDP's
+// Fetch.RequestPattern into a regular expression. '*' matches any number of
+// characters, '?' matches one character, and '\\' escapes the next character.
+func cdpURLPatternRegexp(pattern string) string {
+	var result strings.Builder
+	result.WriteString("^")
+	for i := 0; i < len(pattern); i++ {
+		switch pattern[i] {
+		case '*':
+			result.WriteString(".*")
+		case '?':
+			result.WriteString(".")
+		case '\\':
+			if i+1 < len(pattern) {
+				i++
+				result.WriteString(regexp.QuoteMeta(pattern[i : i+1]))
+			} else {
+				result.WriteString(`\\`)
+			}
+		default:
+			result.WriteString(regexp.QuoteMeta(pattern[i : i+1]))
+		}
+	}
+	result.WriteString("$")
+	return result.String()
+}
+
+func (b *Bridge) setFetchPatterns(sessionID string, patterns []fetchRequestPattern) {
+	b.fetchPatternsMu.Lock()
+	b.fetchPatterns[sessionID] = patterns
+	b.fetchPatternsMu.Unlock()
+}
+
+func (b *Bridge) clearFetchPatterns(sessionID string) {
+	b.fetchPatternsMu.Lock()
+	delete(b.fetchPatterns, sessionID)
+	b.fetchPatternsMu.Unlock()
+}
+
+func (b *Bridge) shouldPauseFetchRequest(sessionID, url, resourceType, requestStage string) bool {
+	b.fetchPatternsMu.RLock()
+	patterns, enabled := b.fetchPatterns[sessionID]
+	if !enabled && sessionID != "" {
+		patterns, enabled = b.fetchPatterns[""]
+	}
+	b.fetchPatternsMu.RUnlock()
+
+	// An enabled Fetch domain with no patterns means intercept everything.
+	// If Fetch is not enabled here, preserve interception requested through
+	// the legacy Network domain or directly by another bridge feature.
+	if !enabled || len(patterns) == 0 {
+		return true
+	}
+
+	for _, pattern := range patterns {
+		stage := pattern.RequestStage
+		if stage == "" {
+			stage = "Request"
+		}
+		if !strings.EqualFold(stage, requestStage) {
+			continue
+		}
+		if pattern.ResourceType != "" && !strings.EqualFold(pattern.ResourceType, resourceType) {
+			continue
+		}
+		if pattern.urlRegexp.MatchString(url) {
+			return true
+		}
+	}
+	return false
+}
+
+// callFetchBackend translates Fetch request actions to the backend's native
+// interception API. Current Juggler exposes actions on the page-scoped Network
+// domain, while the BiDi adapter retains Foxbridge's browser-scoped shim.
+func (b *Bridge) callFetchBackend(sessionID, jugglerMethod, bidiMethod string, params interface{}) (json.RawMessage, error) {
+	if b.isBiDi {
+		return b.callJuggler("", bidiMethod, params)
+	}
+	return b.callJuggler(sessionID, jugglerMethod, params)
+}
+
+func (b *Bridge) continueFetchRequest(sessionID, requestID string) error {
+	_, err := b.callFetchBackend(
+		sessionID,
+		"Network.resumeInterceptedRequest",
+		"Browser.continueInterceptedRequest",
+		map[string]interface{}{"requestId": requestID},
+	)
+	return err
+}
 
 func (b *Bridge) handleFetch(conn *cdp.Connection, msg *cdp.Message) (json.RawMessage, *cdp.Error) {
 	switch msg.Method {
@@ -16,8 +138,15 @@ func (b *Bridge) handleFetch(conn *cdp.Connection, msg *cdp.Message) (json.RawMe
 			HandleAuthRequests bool              `json:"handleAuthRequests"`
 		}
 		if msg.Params != nil {
-			json.Unmarshal(msg.Params, &params)
+			if err := json.Unmarshal(msg.Params, &params); err != nil {
+				return nil, &cdp.Error{Code: -32602, Message: "invalid params"}
+			}
 		}
+		patterns, err := compileFetchPatterns(params.Patterns)
+		if err != nil {
+			return nil, &cdp.Error{Code: -32602, Message: "invalid Fetch pattern"}
+		}
+		b.setFetchPatterns(msg.SessionID, patterns)
 
 		jugglerParams := map[string]interface{}{
 			"enabled": true,
@@ -28,13 +157,15 @@ func (b *Bridge) handleFetch(conn *cdp.Connection, msg *cdp.Message) (json.RawMe
 			}
 		}
 
-		_, err := b.callJuggler("", "Browser.setRequestInterception", jugglerParams)
+		_, err = b.callJuggler("", "Browser.setRequestInterception", jugglerParams)
 		if err != nil {
+			b.clearFetchPatterns(msg.SessionID)
 			return nil, &cdp.Error{Code: -32000, Message: err.Error()}
 		}
 		return json.RawMessage(`{}`), nil
 
 	case "Fetch.disable":
+		b.clearFetchPatterns(msg.SessionID)
 		jugglerParams := map[string]interface{}{
 			"enabled": false,
 		}
@@ -80,8 +211,11 @@ func (b *Bridge) handleFetch(conn *cdp.Connection, msg *cdp.Message) (json.RawMe
 			}
 			jugglerParams["headers"] = headers
 		}
+		if params.PostData != "" {
+			jugglerParams["postData"] = params.PostData
+		}
 
-		_, err := b.callJuggler("", "Browser.continueInterceptedRequest", jugglerParams)
+		_, err := b.callFetchBackend(msg.SessionID, "Network.resumeInterceptedRequest", "Browser.continueInterceptedRequest", jugglerParams)
 		if err != nil {
 			return nil, &cdp.Error{Code: -32000, Message: err.Error()}
 		}
@@ -120,10 +254,10 @@ func (b *Bridge) handleFetch(conn *cdp.Connection, msg *cdp.Message) (json.RawMe
 			"status":     params.ResponseCode,
 			"statusText": statusText,
 			"headers":    headers,
-			"body":       params.Body,
+			"base64body": params.Body,
 		}
 
-		_, err := b.callJuggler("", "Browser.fulfillInterceptedRequest", jugglerParams)
+		_, err := b.callFetchBackend(msg.SessionID, "Network.fulfillInterceptedRequest", "Browser.fulfillInterceptedRequest", jugglerParams)
 		if err != nil {
 			return nil, &cdp.Error{Code: -32000, Message: err.Error()}
 		}
@@ -146,7 +280,7 @@ func (b *Bridge) handleFetch(conn *cdp.Connection, msg *cdp.Message) (json.RawMe
 			"errorCode": errorCode,
 		}
 
-		_, err := b.callJuggler("", "Browser.abortInterceptedRequest", jugglerParams)
+		_, err := b.callFetchBackend(msg.SessionID, "Network.abortInterceptedRequest", "Browser.abortInterceptedRequest", jugglerParams)
 		if err != nil {
 			return nil, &cdp.Error{Code: -32000, Message: err.Error()}
 		}
@@ -194,7 +328,7 @@ func (b *Bridge) handleFetch(conn *cdp.Connection, msg *cdp.Message) (json.RawMe
 			return nil, &cdp.Error{Code: -32602, Message: "invalid params"}
 		}
 
-		result, err := b.callJuggler("", "Browser.getResponseBody", map[string]interface{}{
+		result, err := b.callFetchBackend(msg.SessionID, "Network.getResponseBody", "Browser.getResponseBody", map[string]interface{}{
 			"requestId": params.RequestID,
 		})
 		if err != nil {
@@ -253,7 +387,7 @@ func (b *Bridge) handleFetch(conn *cdp.Connection, msg *cdp.Message) (json.RawMe
 			jugglerParams["headers"] = headers
 		}
 
-		_, err := b.callJuggler("", "Browser.continueInterceptedRequest", jugglerParams)
+		_, err := b.callFetchBackend(msg.SessionID, "Network.resumeInterceptedRequest", "Browser.continueInterceptedRequest", jugglerParams)
 		if err != nil {
 			return nil, &cdp.Error{Code: -32000, Message: err.Error()}
 		}
