@@ -19,6 +19,7 @@ type Bridge struct {
 	sessions   *cdp.SessionManager
 	server     *cdp.Server
 	autoAttach *autoAttachState
+	ownership  *ownershipRegistry
 	// ctxMap maps numeric CDP execution context IDs to Juggler execution context ID strings
 	ctxMapMu   sync.RWMutex
 	ctxMap     map[int]string // cdpContextID → jugglerContextID
@@ -84,7 +85,7 @@ func (b *Bridge) setJugglerBrowserContext(params map[string]interface{}, id stri
 func New(b backend.Backend, sessions *cdp.SessionManager, server *cdp.Server, isBiDi ...bool) *Bridge {
 	bidi := len(isBiDi) > 0 && isBiDi[0]
 	_ = bidi
-	return &Bridge{
+	bridge := &Bridge{
 		backend:              b,
 		isBiDi:               bidi,
 		sessions:             sessions,
@@ -104,12 +105,24 @@ func New(b backend.Backend, sessions *cdp.SessionManager, server *cdp.Server, is
 		pendingContextClear:  make(map[string]bool),
 		fetchPatterns:        make(map[string][]fetchRequestPattern),
 		deterministicApplied: make(map[string]bool),
+		ownership:            newOwnershipRegistry(),
 	}
+	if server != nil {
+		server.SetConnectionCloseHandler(bridge.ConnectionClosed)
+	}
+	return bridge
 }
 
 // HandleMessage dispatches an incoming CDP message to the appropriate domain handler.
 func (b *Bridge) HandleMessage(conn *cdp.Connection, msg *cdp.Message) {
 	method := msg.Method
+	if conn != nil {
+		b.ownership.state(conn)
+	}
+	if err := b.authorize(conn, msg); err != nil {
+		b.sendResponse(conn, msg, nil, err)
+		return
+	}
 
 	var result json.RawMessage
 	var cdpErr *cdp.Error
@@ -160,9 +173,115 @@ func (b *Bridge) HandleMessage(conn *cdp.Connection, msg *cdp.Message) {
 		resp.Result = result
 	}
 
-	if err := conn.Send(resp); err != nil {
-		log.Printf("failed to send CDP response for %s: %v", method, err)
+	b.sendResponse(conn, msg, result, cdpErr)
+}
+
+func (b *Bridge) sendResponse(conn *cdp.Connection, msg *cdp.Message, result json.RawMessage, cdpErr *cdp.Error) {
+	if conn == nil {
+		return
 	}
+	resp := &cdp.Message{ID: msg.ID, SessionID: msg.SessionID}
+	if cdpErr != nil {
+		resp.Error = cdpErr
+	} else {
+		if result == nil {
+			result = json.RawMessage(`{}`)
+		}
+		resp.Result = result
+	}
+	if err := conn.Send(resp); err != nil {
+		log.Printf("failed to send CDP response for %s: %v", msg.Method, err)
+	}
+}
+
+func targetScopedMethod(method string) bool {
+	for _, prefix := range []string{"Page.", "Runtime.", "Input.", "Network.", "Emulation.", "DOM.", "Accessibility.", "Console.", "Fetch.", "Performance.", "IO.", "CSS.", "DOMStorage."} {
+		if strings.HasPrefix(method, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func (b *Bridge) authorize(conn *cdp.Connection, msg *cdp.Message) *cdp.Error {
+	if conn == nil {
+		return nil
+	}
+	if msg.SessionID != "" && !b.ownership.sessionOwned(conn, msg.SessionID) {
+		return &cdp.Error{Code: -32000, Message: "session not found"}
+	}
+	if msg.SessionID == "" && targetScopedMethod(msg.Method) {
+		return &cdp.Error{Code: -32000, Message: "target session required"}
+	}
+	return nil
+}
+
+// ConnectionClosed releases all pages owned by a disconnected CDP client.
+func (b *Bridge) ConnectionClosed(conn *cdp.Connection) {
+	for _, record := range b.ownership.closeConnection(conn) {
+		b.closeRecord(record, true)
+	}
+}
+
+func (b *Bridge) ownedTarget(conn *cdp.Connection, targetID string) bool {
+	if conn == nil {
+		return true
+	}
+	return b.ownership.ownerForTarget(targetID) == conn
+}
+
+func (b *Bridge) closeRecord(record *targetRecord, closeBackend bool) {
+	if !b.ownership.beginCleanup(record) {
+		return
+	}
+	if closeBackend && record.pageSessionID != "" {
+		if _, err := b.callJuggler(record.pageSessionID, "Page.close", nil); err != nil {
+			log.Printf("[ownership] close target %s: %v", record.pageTargetID, err)
+		}
+	}
+	b.emitEvent("Target.detachedFromTarget", map[string]interface{}{
+		"sessionId": record.pageSessionID,
+		"targetId":  record.pageTargetID,
+	}, "")
+	b.emitEvent("Target.targetDestroyed", map[string]interface{}{
+		"targetId": record.pageTargetID,
+	}, "")
+	b.sessions.Remove(record.pageSessionID)
+	b.sessions.Remove(record.tabSessionID)
+	b.autoAttach.mu.Lock()
+	if record.jugglerSessionID != "" {
+		delete(b.autoAttach.pairs, record.jugglerSessionID)
+	}
+	b.autoAttach.mu.Unlock()
+	b.ownership.remove(record)
+}
+
+func (b *Bridge) publishOwnedPair(pair *targetPair) {
+	record := b.ownership.recordForTarget(pair.pageTargetID)
+	if record == nil || record.owner == nil {
+		return
+	}
+	if b.ownership.discoverEnabled(record.owner) {
+		url := pair.url
+		if url == "" {
+			url = "about:blank"
+		}
+		_ = b.server.Send(record.owner, &cdp.Message{
+			Method: "Target.targetCreated",
+			Params: mustJSON(map[string]interface{}{"targetInfo": map[string]interface{}{
+				"targetId": pair.pageTargetID, "type": "page", "title": "", "url": url,
+				"attached": true, "canAccessOpener": false, "browserContextId": pair.browserCtxID,
+			}}),
+		})
+	}
+	if b.ownership.autoAttachEnabled(record.owner) {
+		b.emitAutoAttachPair(pair)
+	}
+}
+
+func mustJSON(value interface{}) json.RawMessage {
+	raw, _ := json.Marshal(value)
+	return raw
 }
 
 // resolveSession maps a CDP sessionID to a Juggler sessionID.
@@ -266,15 +385,49 @@ func (b *Bridge) jugglerFrameIDForSession(cdpSessionID, frameID string) string {
 	return frameID
 }
 
-// emitEvent sends a CDP event to all connected clients.
+// emitEvent sends a CDP event only to the owner of its target/session.
 func (b *Bridge) emitEvent(method string, params interface{}, sessionID string) {
 	var raw json.RawMessage
 	if params != nil {
 		raw, _ = json.Marshal(params)
 	}
-	b.server.Broadcast(&cdp.Message{
-		Method:    method,
-		Params:    raw,
-		SessionID: sessionID,
-	})
+	owner := b.ownership.sessionOwner(sessionID)
+	if owner == nil {
+		owner = b.ownerForEvent(raw, sessionID)
+	}
+	if owner == nil {
+		log.Printf("[event] dropping unowned %s (session=%s)", method, sessionID)
+		return
+	}
+	if err := b.server.Send(owner, &cdp.Message{Method: method, Params: raw, SessionID: sessionID}); err != nil {
+		log.Printf("[event] send %s: %v", method, err)
+	}
+}
+
+func (b *Bridge) ownerForEvent(raw json.RawMessage, sessionID string) *cdp.Connection {
+	if sessionID != "" {
+		return nil
+	}
+	var payload struct {
+		TargetID   string `json:"targetId"`
+		TargetInfo struct {
+			TargetID string `json:"targetId"`
+		} `json:"targetInfo"`
+		FrameID string `json:"frameId"`
+	}
+	if json.Unmarshal(raw, &payload) != nil {
+		return nil
+	}
+	if payload.TargetID != "" {
+		return b.ownership.ownerForTarget(payload.TargetID)
+	}
+	if payload.TargetInfo.TargetID != "" {
+		return b.ownership.ownerForTarget(payload.TargetInfo.TargetID)
+	}
+	if payload.FrameID != "" {
+		if info, ok := b.sessions.GetByFrameID(payload.FrameID); ok {
+			return b.ownership.ownerForTarget(info.TargetID)
+		}
+	}
+	return nil
 }

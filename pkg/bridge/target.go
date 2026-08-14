@@ -13,8 +13,23 @@ import (
 func (b *Bridge) handleTarget(conn *cdp.Connection, msg *cdp.Message) (json.RawMessage, *cdp.Error) {
 	switch msg.Method {
 	case "Target.setDiscoverTargets":
-		// Emit targetCreated for all known targets (both tabs and pages).
+		var params struct {
+			Discover bool `json:"discover"`
+		}
+		if msg.Params != nil {
+			if err := json.Unmarshal(msg.Params, &params); err != nil {
+				return nil, &cdp.Error{Code: -32602, Message: "invalid params"}
+			}
+		}
+		b.ownership.setDiscover(conn, params.Discover)
+		if conn != nil && !params.Discover {
+			return json.RawMessage(`{}`), nil
+		}
+		// Emit targetCreated only for owned page targets.
 		for _, info := range b.sessions.All() {
+			if info.Type == "tab" || !b.ownedTarget(conn, info.TargetID) {
+				continue
+			}
 			// Flat CDP clients consume page targets directly. Advertising the
 			// synthetic tab as well makes them wait for a redundant child attach.
 			if info.Type == "tab" {
@@ -47,17 +62,24 @@ func (b *Bridge) handleTarget(conn *cdp.Connection, msg *cdp.Message) (json.RawM
 		json.Unmarshal(msg.Params, &params)
 
 		if msg.SessionID == "" {
-			// Browser-level setAutoAttach: emit pending target attachments immediately.
-			b.autoAttach.mu.Lock()
-			b.autoAttach.enabled = params.AutoAttach
-			pending := b.autoAttach.pending
-			b.autoAttach.pending = nil
-			b.autoAttach.mu.Unlock()
-
-			if params.AutoAttach {
-				log.Printf("[target] setAutoAttach on browser session, emitting %d pending targets", len(pending))
-				for _, pair := range pending {
-					b.emitAutoAttachPair(pair)
+			if conn != nil {
+				b.ownership.setAutoAttach(conn, params.AutoAttach)
+				if params.AutoAttach {
+					for _, pair := range b.ownership.ownedPairs(conn) {
+						b.publishOwnedPair(pair)
+					}
+				}
+			} else {
+				// Compatibility path for direct unit calls without a connection.
+				b.autoAttach.mu.Lock()
+				b.autoAttach.enabled = params.AutoAttach
+				pending := b.autoAttach.pending
+				b.autoAttach.pending = nil
+				b.autoAttach.mu.Unlock()
+				if params.AutoAttach {
+					for _, pair := range pending {
+						b.emitAutoAttachPair(pair)
+					}
 				}
 			}
 		} else {
@@ -92,6 +114,11 @@ func (b *Bridge) handleTarget(conn *cdp.Connection, msg *cdp.Message) (json.RawM
 		if err := json.Unmarshal(msg.Params, &params); err != nil {
 			return nil, &cdp.Error{Code: -32602, Message: "invalid params"}
 		}
+		if conn != nil && !b.isSyntheticDefaultBrowserContextID(params.BrowserContextID) {
+			return nil, &cdp.Error{Code: -32000, Message: "browser contexts are disabled"}
+		}
+		generation := b.ownership.beginCreate(conn)
+		defer b.ownership.finishCreate(generation)
 
 		jugglerParams := map[string]interface{}{}
 		b.setJugglerBrowserContext(jugglerParams, params.BrowserContextID)
@@ -111,6 +138,10 @@ func (b *Bridge) handleTarget(conn *cdp.Connection, msg *cdp.Message) (json.RawM
 		targetID := pageResult.TargetID
 		if targetID == "" {
 			targetID = uuid.New().String()
+		}
+
+		if record := b.ownership.claimTarget(conn, targetID, generation); record != nil && record.owner == conn && record.pair != nil {
+			b.publishOwnedPair(record.pair)
 		}
 
 		if params.URL != "" && params.URL != "about:blank" {
@@ -136,63 +167,27 @@ func (b *Bridge) handleTarget(conn *cdp.Connection, msg *cdp.Message) (json.RawM
 			return nil, &cdp.Error{Code: -32602, Message: "invalid params"}
 		}
 
-		info, ok := b.sessions.GetByTarget(params.TargetID)
-		if !ok {
+		if !b.ownedTarget(conn, params.TargetID) {
 			return nil, &cdp.Error{Code: -32000, Message: fmt.Sprintf("target %s not found", params.TargetID)}
 		}
-
-		sessionID := info.SessionID
-		targetID := info.TargetID
-
-		// Emit detach events BEFORE closing — Puppeteer needs them to unblock
-		{
-			// Emit detachedFromTarget + targetDestroyed for all sessions associated
-			// with this target. Also emit on any tab sessions that own this page.
-			b.autoAttach.mu.Lock()
-			found := false
-			for jKey, pair := range b.autoAttach.pairs {
-				if pair.pageTargetID == targetID || pair.tabTargetID == targetID ||
-					pair.pageSessionID == sessionID {
-					found = true
-					b.autoAttach.mu.Unlock()
-					b.emitEvent("Target.detachedFromTarget", map[string]interface{}{
-						"sessionId": pair.pageSessionID, "targetId": pair.pageTargetID,
-					}, pair.tabSessionID)
-					b.emitEvent("Target.detachedFromTarget", map[string]interface{}{
-						"sessionId": pair.tabSessionID, "targetId": pair.tabTargetID,
-					}, "")
-					b.emitEvent("Target.targetDestroyed", map[string]interface{}{"targetId": pair.pageTargetID}, "")
-					b.emitEvent("Target.targetDestroyed", map[string]interface{}{"targetId": pair.tabTargetID}, "")
-					b.sessions.Remove(pair.pageSessionID)
-					b.sessions.Remove(pair.tabSessionID)
-					b.autoAttach.mu.Lock()
-					delete(b.autoAttach.pairs, jKey)
-					b.autoAttach.mu.Unlock()
-					break
-				}
+		record := b.ownership.recordForTarget(params.TargetID)
+		if record == nil {
+			if conn != nil {
+				return nil, &cdp.Error{Code: -32000, Message: fmt.Sprintf("target %s not found", params.TargetID)}
 			}
-			if !found {
-				b.autoAttach.mu.Unlock()
+			if info, ok := b.sessions.GetByTarget(params.TargetID); ok {
+				b.sessions.Remove(info.SessionID)
+				return json.RawMessage(`{"success":true}`), nil
 			}
-
-			// Always emit with the original IDs as fallback
-			b.emitEvent("Target.detachedFromTarget", map[string]interface{}{
-				"sessionId": sessionID, "targetId": targetID,
-			}, "")
-			b.emitEvent("Target.targetDestroyed", map[string]interface{}{"targetId": targetID}, "")
-			if !found {
-				b.sessions.Remove(sessionID)
-			}
+			return nil, &cdp.Error{Code: -32000, Message: fmt.Sprintf("target %s not found", params.TargetID)}
 		}
-
-		// Close the page asynchronously — ignore errors since sessions are already cleaned up.
-		// Note: for BiDi, browsingContext.close can terminate the Firefox session entirely.
-		// Skip actual close call — foxbridge state is already cleaned up above.
-		// The browser context will be garbage collected when the session ends.
-
+		b.closeRecord(record, true)
 		return json.RawMessage(`{"success":true}`), nil
 
 	case "Target.createBrowserContext":
+		if conn != nil {
+			return nil, &cdp.Error{Code: -32000, Message: "browser contexts are disabled"}
+		}
 		result, err := b.callJuggler("", "Browser.createBrowserContext", nil)
 		if err != nil {
 			return nil, &cdp.Error{Code: -32000, Message: err.Error()}
@@ -206,6 +201,9 @@ func (b *Bridge) handleTarget(conn *cdp.Connection, msg *cdp.Message) (json.RawM
 		return marshalResult(map[string]string{"browserContextId": ctxResult.BrowserContextID})
 
 	case "Target.disposeBrowserContext":
+		if conn != nil {
+			return nil, &cdp.Error{Code: -32000, Message: "browser contexts are disabled"}
+		}
 		var params struct {
 			BrowserContextID string `json:"browserContextId"`
 		}
@@ -224,6 +222,9 @@ func (b *Bridge) handleTarget(conn *cdp.Connection, msg *cdp.Message) (json.RawM
 	case "Target.getTargets":
 		targets := []map[string]interface{}{}
 		for _, s := range b.sessions.All() {
+			if s.Type == "tab" || !b.ownedTarget(conn, s.TargetID) {
+				continue
+			}
 			targets = append(targets, map[string]interface{}{
 				"targetId":         s.TargetID,
 				"type":             s.Type,
@@ -244,6 +245,9 @@ func (b *Bridge) handleTarget(conn *cdp.Connection, msg *cdp.Message) (json.RawM
 			return nil, &cdp.Error{Code: -32602, Message: "invalid params"}
 		}
 
+		if !b.ownedTarget(conn, params.TargetID) {
+			return nil, &cdp.Error{Code: -32000, Message: "target not found"}
+		}
 		// Check if we already have a session for this target.
 		if info, ok := b.sessions.GetByTarget(params.TargetID); ok {
 			return marshalResult(map[string]string{"sessionId": info.SessionID})
@@ -281,9 +285,16 @@ func (b *Bridge) handleTarget(conn *cdp.Connection, msg *cdp.Message) (json.RawM
 			SessionID: sessionID,
 			Type:      "browser",
 		})
+		b.ownership.registerBrowserSession(conn, sessionID)
 		return marshalResult(map[string]string{"sessionId": sessionID})
 
 	case "Target.activateTarget":
+		var params struct {
+			TargetID string `json:"targetId"`
+		}
+		if err := json.Unmarshal(msg.Params, &params); err != nil || !b.ownedTarget(conn, params.TargetID) {
+			return nil, &cdp.Error{Code: -32000, Message: "target not found"}
+		}
 		return json.RawMessage(`{}`), nil
 
 	case "Target.detachFromTarget":
@@ -295,11 +306,17 @@ func (b *Bridge) handleTarget(conn *cdp.Connection, msg *cdp.Message) (json.RawM
 		if msg.Params != nil {
 			json.Unmarshal(msg.Params, &params)
 		}
+		if !b.ownership.sessionOwned(conn, params.SessionID) {
+			return nil, &cdp.Error{Code: -32000, Message: "session not found"}
+		}
 		log.Printf("[target] detachFromTarget: sessionId=%s (no-op, page stays open)", params.SessionID)
 		return json.RawMessage(`{}`), nil
 
 	case "Target.getBrowserContexts":
 		contexts := b.sessions.GetBrowserContexts()
+		if conn != nil {
+			contexts = []string{syntheticDefaultBrowserContextID}
+		}
 		if contexts == nil {
 			contexts = []string{}
 		}
@@ -329,6 +346,9 @@ func (b *Bridge) handleTarget(conn *cdp.Connection, msg *cdp.Message) (json.RawM
 					"canAccessOpener": false,
 				},
 			})
+		}
+		if !b.ownedTarget(conn, params.TargetID) {
+			return nil, &cdp.Error{Code: -32000, Message: "target not found"}
 		}
 		if info, ok := b.sessions.GetByTarget(params.TargetID); ok {
 			return marshalResult(map[string]interface{}{

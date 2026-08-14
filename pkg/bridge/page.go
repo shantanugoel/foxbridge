@@ -143,27 +143,14 @@ func (b *Bridge) handlePage(conn *cdp.Connection, msg *cdp.Message) (json.RawMes
 		delete(b.lastQuerySkips, msg.SessionID)
 		b.lastQueryMu.Unlock()
 
-		// Get target info before closing
-		targetID := ""
-		if info, ok := b.sessions.Get(msg.SessionID); ok {
-			targetID = info.TargetID
+		if record := b.ownership.recordForSession(msg.SessionID); record != nil {
+			b.closeRecord(record, true)
+			return json.RawMessage(`{}`), nil
 		}
-
-		_, err := b.callJuggler(msg.SessionID, "Page.close", nil)
-		if err != nil {
+		// Compatibility for direct unit calls that do not carry a connection.
+		if _, err := b.callJuggler(msg.SessionID, "Page.close", nil); err != nil {
 			return nil, &cdp.Error{Code: -32000, Message: err.Error()}
 		}
-
-		// Proactively emit Target.targetDestroyed — Juggler may not always emit
-		// Browser.detachedFromTarget for Page.close, causing Puppeteer to hang.
-		if targetID != "" {
-			go func() {
-				b.emitEvent("Target.targetDestroyed", map[string]interface{}{
-					"targetId": targetID,
-				}, "")
-			}()
-		}
-
 		return json.RawMessage(`{}`), nil
 
 	case "Page.captureScreenshot":

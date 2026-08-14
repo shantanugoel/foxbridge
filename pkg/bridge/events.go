@@ -17,6 +17,7 @@ type targetPair struct {
 	tabTargetID      string
 	pageSessionID    string
 	pageTargetID     string
+	jugglerSessionID string
 	browserCtxID     string
 	url              string
 	pageAttachedRoot bool
@@ -82,9 +83,11 @@ func (b *Bridge) SetupEventSubscriptions() {
 
 			log.Printf("[event] registered %s target=%s session=%s", targetType, targetID, workerSessionID)
 
-			b.autoAttach.mu.Lock()
+			record := b.ownership.registerWorker(nil, targetID, workerSessionID, jugglerSessionID)
 			autoEnabled := b.autoAttach.enabled
-			b.autoAttach.mu.Unlock()
+			if record.owner != nil {
+				autoEnabled = b.ownership.autoAttachEnabled(record.owner)
+			}
 
 			if autoEnabled {
 				b.emitEvent("Target.attachedToTarget", map[string]interface{}{
@@ -109,12 +112,13 @@ func (b *Bridge) SetupEventSubscriptions() {
 		tabTargetID := uuid.New().String()
 
 		pair := &targetPair{
-			tabSessionID:  tabSessionID,
-			tabTargetID:   tabTargetID,
-			pageSessionID: pageSessionID,
-			pageTargetID:  targetID,
-			browserCtxID:  browserContextID,
-			url:           ev.TargetInfo.URL,
+			tabSessionID:     tabSessionID,
+			tabTargetID:      tabTargetID,
+			pageSessionID:    pageSessionID,
+			pageTargetID:     targetID,
+			jugglerSessionID: jugglerSessionID,
+			browserCtxID:     browserContextID,
+			url:              ev.TargetInfo.URL,
 		}
 
 		// Register the PAGE session (what actually talks to Juggler)
@@ -147,18 +151,23 @@ func (b *Bridge) SetupEventSubscriptions() {
 			Type:             "tab",
 		})
 
+		record := b.ownership.registerPair(nil, pair)
 		b.autoAttach.mu.Lock()
 		b.autoAttach.pairs[jugglerSessionID] = pair
-		if b.autoAttach.enabled {
-			// Auto-attach is active — emit the tab attachment and then the page
-			// attachment immediately. Playwright/OpenClaw does not issue a second
-			// Target.setAutoAttach on the tab session in this connect path.
-			b.autoAttach.mu.Unlock()
-			b.emitAutoAttachPair(pair)
+		b.autoAttach.mu.Unlock()
+		if record.owner != nil {
+			if b.ownership.autoAttachEnabled(record.owner) {
+				b.publishOwnedPair(pair)
+			}
 		} else {
-			// Auto-attach not yet active — queue for later
-			b.autoAttach.pending = append(b.autoAttach.pending, pair)
-			b.autoAttach.mu.Unlock()
+			b.autoAttach.mu.Lock()
+			if b.autoAttach.enabled {
+				b.autoAttach.mu.Unlock()
+				b.emitAutoAttachPair(pair)
+			} else {
+				b.autoAttach.pending = append(b.autoAttach.pending, pair)
+				b.autoAttach.mu.Unlock()
+			}
 		}
 	})
 
@@ -174,58 +183,17 @@ func (b *Bridge) SetupEventSubscriptions() {
 		}
 
 		targetID := ev.TargetID
-		// Find the CDP session for this target.
-		info, ok := b.sessions.GetByTarget(targetID)
-		if !ok {
-			// Try by juggler session ID.
-			info, ok = b.sessions.GetByJugglerSession(ev.SessionID)
-		}
-
-		cdpSessionID := ""
-		if ok {
-			cdpSessionID = info.SessionID
-		}
-
-		// Also find and clean up the tab session
-		b.autoAttach.mu.Lock()
-		if pair, exists := b.autoAttach.pairs[ev.SessionID]; exists {
-			// Emit destroy for both tab and page
-			b.autoAttach.mu.Unlock()
-
-			b.emitEvent("Target.targetDestroyed", map[string]interface{}{
-				"targetId": pair.pageTargetID,
-			}, "")
-			b.emitEvent("Target.targetDestroyed", map[string]interface{}{
-				"targetId": pair.tabTargetID,
-			}, "")
-
-			if cdpSessionID != "" {
-				b.emitEvent("Target.detachedFromTarget", map[string]interface{}{
-					"sessionId": cdpSessionID,
-					"targetId":  targetID,
-				}, "")
+		if targetID == "" {
+			if info, ok := b.sessions.GetByJugglerSession(ev.SessionID); ok {
+				targetID = info.TargetID
 			}
-
-			b.sessions.Remove(pair.pageSessionID)
-			b.sessions.Remove(pair.tabSessionID)
-
-			b.autoAttach.mu.Lock()
-			delete(b.autoAttach.pairs, ev.SessionID)
-			b.autoAttach.mu.Unlock()
-		} else {
-			b.autoAttach.mu.Unlock()
-
-			b.emitEvent("Target.targetDestroyed", map[string]interface{}{
-				"targetId": targetID,
-			}, "")
-
-			if cdpSessionID != "" {
-				b.emitEvent("Target.detachedFromTarget", map[string]interface{}{
-					"sessionId": cdpSessionID,
-					"targetId":  targetID,
-				}, "")
-				b.sessions.Remove(cdpSessionID)
-			}
+		}
+		if record := b.ownership.recordForTarget(targetID); record != nil {
+			b.closeRecord(record, false)
+			return
+		}
+		if info, ok := b.sessions.GetByTarget(targetID); ok {
+			b.sessions.Remove(info.SessionID)
 		}
 	})
 
@@ -858,13 +826,15 @@ func (b *Bridge) SetupEventSubscriptions() {
 		}
 		json.Unmarshal(params, &ev)
 
-		// Download events are browser-level — broadcast to all page sessions
+		cdpSessionID := b.resolveCDPSession(sessionID)
+		if cdpSessionID == "" {
+			log.Printf("[event] dropping unattributable download %s", ev.UUID)
+			return
+		}
 		b.emitEvent("Page.downloadWillBegin", map[string]interface{}{
-			"frameId":           "",
-			"guid":              ev.UUID,
-			"url":               ev.URL,
+			"frameId": "", "guid": ev.UUID, "url": ev.URL,
 			"suggestedFilename": ev.SuggestedFileName,
-		}, "")
+		}, cdpSessionID)
 	})
 
 	b.backend.Subscribe("Browser.downloadFinished", func(sessionID string, params json.RawMessage) {
@@ -883,10 +853,14 @@ func (b *Bridge) SetupEventSubscriptions() {
 			state = "canceled"
 		}
 
+		cdpSessionID := b.resolveCDPSession(sessionID)
+		if cdpSessionID == "" {
+			log.Printf("[event] dropping unattributable download %s", ev.UUID)
+			return
+		}
 		b.emitEvent("Page.downloadProgress", map[string]interface{}{
-			"guid":  ev.UUID,
-			"state": state,
-		}, "")
+			"guid": ev.UUID, "state": state,
+		}, cdpSessionID)
 	})
 
 	// Screencast frame events
@@ -937,14 +911,9 @@ func (b *Bridge) SetupEventSubscriptions() {
 			}
 		}
 
-		// Last resort: find any page session to deliver the event
 		if cdpSessionID == "" {
-			for _, info := range b.sessions.All() {
-				if info.Type == "page" {
-					cdpSessionID = info.SessionID
-					break
-				}
-			}
+			log.Printf("[event] dropping unattributable Browser.requestIntercepted requestId=%s", ev.RequestID)
+			return
 		}
 
 		// Use top-level fields (new Juggler format) or nested request fields (fallback)
@@ -1119,9 +1088,5 @@ func (b *Bridge) resolveCDPSession(jugglerSessionID string) string {
 
 // emitEventRaw sends a CDP event with raw JSON params.
 func (b *Bridge) emitEventRaw(method string, params json.RawMessage, sessionID string) {
-	b.server.Broadcast(&cdp.Message{
-		Method:    method,
-		Params:    params,
-		SessionID: sessionID,
-	})
+	b.emitEvent(method, params, sessionID)
 }

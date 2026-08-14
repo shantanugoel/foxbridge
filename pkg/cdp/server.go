@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 
 	"github.com/gorilla/websocket"
@@ -32,16 +33,18 @@ type BatchRequest struct {
 
 // Connection represents a single CDP WebSocket connection.
 type Connection struct {
-	ws          *websocket.Conn
-	writeMu     sync.Mutex
-	recorder    FrameRecorder
-	compress    bool         // Enable compression
-	batchSize   int          // Commands to batch
-	pendingBuf  []Message    // Buffer for batching
-	batchMu     sync.Mutex
+	ws         *websocket.Conn
+	writeMu    sync.Mutex
+	recorder   FrameRecorder
+	compress   bool      // Enable compression
+	batchSize  int       // Commands to batch
+	pendingBuf []Message // Buffer for batching
+	batchMu    sync.Mutex
+	closeOnce  sync.Once
+	closeHook  func(*Connection)
 }
 
-var(
+var (
 	// Compression level (default: best speed)
 	flateLevel = flate.BestSpeed
 )
@@ -52,21 +55,21 @@ func (c *Connection) Send(msg *Message) error {
 	if err != nil {
 		return fmt.Errorf("marshal CDP message: %w", err)
 	}
-	
+
 	// Option 3: Compression - reduces payload size by ~70%
 	if c.compress {
 		data = compressBytes(data)
 	}
-	
+
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	
+
 	// Option 1: Binary framing (more efficient than text)
 	msgType := websocket.BinaryMessage
 	if c.compress {
 		msgType = websocket.BinaryMessage
 	}
-	
+
 	if err := c.ws.WriteMessage(msgType, data); err != nil {
 		return err
 	}
@@ -84,15 +87,15 @@ func (c *Connection) SendBatch(msgs []Message) error {
 	if err != nil {
 		return fmt.Errorf("marshal batch: %w", err)
 	}
-	
+
 	// Option 3: Compression for batch
 	if c.compress {
 		data = compressBytes(data)
 	}
-	
+
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	
+
 	msgType := websocket.BinaryMessage
 	if err := c.ws.WriteMessage(msgType, data); err != nil {
 		return err
@@ -111,17 +114,19 @@ func compressBytes(data []byte) []byte {
 
 // Server is the CDP WebSocket server.
 type Server struct {
-	handler  MessageHandler
-	upgrader websocket.Upgrader
-	host     string
-	port     int
-	socket   string
-	recorder FrameRecorder
-	conns    map[*Connection]struct{}
-	connsMu  sync.Mutex
-	sessions *SessionManager
-	serverMu sync.Mutex
-	server   *http.Server
+	handler       MessageHandler
+	upgrader      websocket.Upgrader
+	host          string
+	port          int
+	socket        string
+	recorder      FrameRecorder
+	conns         map[*Connection]struct{}
+	connsMu       sync.Mutex
+	sessions      *SessionManager
+	serverMu      sync.Mutex
+	server        *http.Server
+	closeHook     func(*Connection)
+	ownershipMode bool
 }
 
 // NewServer creates a CDP server on the given port.
@@ -141,6 +146,21 @@ func NewServer(port int, handler MessageHandler, sessions *SessionManager) *Serv
 // SetRecorder configures an optional wire recorder for inbound and outbound CDP frames.
 func (s *Server) SetRecorder(recorder FrameRecorder) {
 	s.recorder = recorder
+}
+
+// SetConnectionCloseHandler is called exactly once when a client disconnects.
+func (s *Server) SetConnectionCloseHandler(handler func(*Connection)) {
+	s.closeHook = handler
+	s.ownershipMode = handler != nil
+}
+
+func (c *Connection) close() {
+	c.closeOnce.Do(func() {
+		_ = c.ws.Close()
+		if c.closeHook != nil {
+			c.closeHook(c)
+		}
+	})
 }
 
 // SetHost overrides the TCP host used when serving over a network port.
@@ -309,8 +329,16 @@ func (s *Server) closeConnections() {
 	s.connsMu.Unlock()
 
 	for _, c := range conns {
-		_ = c.ws.Close()
+		c.close()
 	}
+}
+
+// Send targets one CDP connection without exposing the message to peers.
+func (s *Server) Send(conn *Connection, msg *Message) error {
+	if conn == nil {
+		return fmt.Errorf("nil CDP connection")
+	}
+	return conn.Send(msg)
 }
 
 // Broadcast sends a CDP message to all connected clients.
@@ -347,6 +375,10 @@ func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
+	if s.ownershipMode {
+		_, _ = w.Write([]byte("[]"))
+		return
+	}
 	if s.sessions == nil {
 		w.Write([]byte("[]"))
 		return
@@ -379,13 +411,17 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
+	if s.ownershipMode && strings.HasPrefix(r.URL.Path, "/devtools/page/") {
+		http.Error(w, "direct page WebSockets are disabled", http.StatusForbidden)
+		return
+	}
 	ws, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("websocket upgrade error: %v", err)
 		return
 	}
 
-	conn := &Connection{ws: ws, recorder: s.recorder}
+	conn := &Connection{ws: ws, recorder: s.recorder, closeHook: s.closeHook}
 	s.connsMu.Lock()
 	s.conns[conn] = struct{}{}
 	s.connsMu.Unlock()
@@ -394,7 +430,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		s.connsMu.Lock()
 		delete(s.conns, conn)
 		s.connsMu.Unlock()
-		ws.Close()
+		conn.close()
 	}()
 
 	for {
