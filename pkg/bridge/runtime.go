@@ -95,6 +95,20 @@ func (b *Bridge) handleRuntime(conn *cdp.Connection, msg *cdp.Message) (json.Raw
 			execCtxID = latest
 		}
 
+		// A session that has just attached may not have seen its first
+		// Runtime.executionContextCreated yet. Juggler rejects the call outright
+		// when executionContextId is missing ("Expected <root>.executionContextId
+		// to be |string|"), so wait for it rather than sending an unusable call.
+		// Session-less calls have no context to wait on and keep their historical
+		// pass-through behaviour.
+		if execCtxID == "" && msg.SessionID != "" {
+			ctxID, ok := b.waitForContext(msg.SessionID, "", executionContextTimeout)
+			if !ok {
+				return nil, &cdp.Error{Code: -32000, Message: "execution context not available for session"}
+			}
+			execCtxID = ctxID
+		}
+
 		// If awaitPromise is requested, wrap the expression so the promise is resolved
 		// before returning. Juggler's Runtime.evaluate doesn't support awaitPromise natively.
 		expression := params.Expression

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/url"
 	"time"
 
 	"github.com/VulpineOS/foxbridge/pkg/cdp"
@@ -36,18 +37,48 @@ func (b *Bridge) handlePage(conn *cdp.Connection, msg *cdp.Message) (json.RawMes
 			jugglerParams["frameId"] = b.jugglerFrameIDForSession(msg.SessionID, params.FrameID)
 		}
 
-		// Use the stored frameId if available, otherwise try to discover it
+		// Use the stored frameId if available, otherwise try to discover it.
+		// The session's main frame is learned from Page.frameAttached and
+		// Runtime.executionContextCreated, which can still be in flight just after
+		// an attach. Sending the call without one makes Juggler reject it outright
+		// ("Expected <root>.frameId to be |string|"), so wait for it instead —
+		// briefly, and only when we have nothing better to use.
 		if _, hasFrame := jugglerParams["frameId"]; !hasFrame || jugglerParams["frameId"] == "main" {
-			if info, ok := b.sessions.Get(msg.SessionID); ok && info.FrameID != "" {
-				jugglerParams["frameId"] = info.FrameID
+			frameID, ok := b.waitForMainFrame(msg.SessionID, mainFrameTimeout)
+			if !ok {
+				return nil, &cdp.Error{Code: -32000, Message: "main frame not available for session"}
 			}
+			jugglerParams["frameId"] = frameID
 		}
+
+		// Capture the pre-navigation execution context so the wait below can tell
+		// when the new document has taken over.
+		currentURL := ""
+		if info, ok := b.sessions.Get(msg.SessionID); ok {
+			currentURL = info.URL
+		}
+		priorCtx := b.latestContextForSession(msg.SessionID)
 
 		jp, _ := json.Marshal(jugglerParams)
 		log.Printf("[page] navigate: params=%s cdpSession=%s", string(jp), msg.SessionID)
 		result, err := b.callJuggler(msg.SessionID, "Page.navigate", jugglerParams)
 		if err != nil {
 			return nil, &cdp.Error{Code: -32000, Message: err.Error()}
+		}
+
+		// Juggler resolves Page.navigate as soon as the navigation is accepted,
+		// but Runtime.evaluate targets whatever latestCtx holds — still the
+		// outgoing document until Runtime.executionContextCreated arrives. Chrome
+		// resolves Page.navigate on commit, so callers reasonably read the page
+		// straight afterwards. Returning early lets them evaluate against the old
+		// document (a stale "readyState: complete") or one mid-teardown ("Failed
+		// to find execution context"). Wait for the context to roll over.
+		// Same-document navigations keep their context, so skip the wait there.
+		if !sameDocumentNavigation(currentURL, params.URL) {
+			if _, ok := b.waitForContext(msg.SessionID, priorCtx, navigationCommitTimeout); !ok {
+				log.Printf("[page] navigate: context rollover timed out cdpSession=%s url=%s",
+					msg.SessionID, params.URL)
+			}
 		}
 
 		// Juggler returns { navigationId, frameId }. CDP expects { frameId, loaderId }.
@@ -904,6 +935,99 @@ func (b *Bridge) handlePage(conn *cdp.Connection, msg *cdp.Message) (json.RawMes
 
 	default:
 		return nil, &cdp.Error{Code: -32601, Message: fmt.Sprintf("method not found: %s", msg.Method)}
+	}
+}
+
+// navigationCommitTimeout bounds how long Page.navigate waits for the new
+// document's execution context. A navigation that never commits (DNS failure,
+// download, 204) waits this out and then returns normally, matching the old
+// non-blocking behaviour rather than failing the call.
+const navigationCommitTimeout = 5 * time.Second
+
+// mainFrameTimeout bounds how long a call waits for the session's main frame to
+// be learned. Attach-time frame events normally land in milliseconds; this only
+// has to cover a browser that has become slow enough for them to lag.
+const mainFrameTimeout = 3 * time.Second
+
+// executionContextTimeout bounds how long a call waits for a freshly attached
+// session's first execution context, same reasoning as mainFrameTimeout.
+const executionContextTimeout = 3 * time.Second
+
+// waitForMainFrame returns the session's main frame ID, waiting for it if the
+// attach-time frame events have not landed yet.
+//
+// ponytail: 10ms polling, matching waitForPageSession; the frame arrives on an
+// event, so there is nothing to await on directly without new plumbing.
+func (b *Bridge) waitForMainFrame(cdpSessionID string, timeout time.Duration) (string, bool) {
+	if cdpSessionID == "" {
+		return "", false
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		if info, ok := b.sessions.Get(cdpSessionID); ok && info.FrameID != "" {
+			return info.FrameID, true
+		}
+		if !time.Now().Before(deadline) {
+			return "", false
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// sameDocumentNavigation reports whether navigating from one URL to the other
+// only changes the fragment. Those keep the existing execution context, so
+// waiting for a rollover that never comes would just stall the call.
+//
+// An identical URL is deliberately not same-document: re-navigating to the page
+// you are already on is a reload, which does build a new document and context.
+func sameDocumentNavigation(currentURL, targetURL string) bool {
+	if currentURL == "" || targetURL == "" {
+		return false
+	}
+	current, err := url.Parse(currentURL)
+	if err != nil {
+		return false
+	}
+	target, err := url.Parse(targetURL)
+	if err != nil {
+		return false
+	}
+	if !target.IsAbs() {
+		target = current.ResolveReference(target)
+	}
+	if current.Fragment == target.Fragment {
+		return false
+	}
+	current.Fragment, target.Fragment = "", ""
+	current.RawFragment, target.RawFragment = "", ""
+	return current.String() == target.String()
+}
+
+// waitForContext blocks until the session has an execution context that differs
+// from priorCtx, and returns it. Pass priorCtx "" to wait for any context at all
+// (a freshly attached session), or the pre-navigation context to wait for the
+// new document to install its own.
+//
+// Juggler requires an executionContextId on evaluate and a frameId on navigate;
+// omitting either makes it reject the call outright, so callers wait here rather
+// than sending something Juggler cannot use.
+//
+// ponytail: 10ms polling, matching waitForPageSession; swap for a
+// navigationCommitted waiter if navigate latency ever shows up in profiles.
+func (b *Bridge) waitForContext(cdpSessionID, priorCtx string, timeout time.Duration) (string, bool) {
+	if cdpSessionID == "" {
+		return "", false
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		current := b.latestContextForSession(cdpSessionID)
+		if current != "" && current != priorCtx {
+			return current, true
+		}
+		if !time.Now().Before(deadline) {
+			return "", false
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

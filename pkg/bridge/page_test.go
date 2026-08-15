@@ -983,3 +983,87 @@ func TestHandlePage_DescribeNode_DelegatesToDOM(t *testing.T) {
 		t.Errorf("nodeName = %q, want IFRAME", parsed.Node.NodeName)
 	}
 }
+
+func TestSameDocumentNavigation(t *testing.T) {
+	cases := []struct {
+		name    string
+		current string
+		target  string
+		want    bool
+	}{
+		{"fragment added", "https://example.com/a", "https://example.com/a#top", true},
+		{"fragment changed", "https://example.com/a#one", "https://example.com/a#two", true},
+		{"fragment removed", "https://example.com/a#one", "https://example.com/a", true},
+		{"relative fragment", "https://example.com/a", "#top", true},
+		{"different path", "https://example.com/a", "https://example.com/b", false},
+		{"different query", "https://example.com/a", "https://example.com/a?x=1", false},
+		{"different host", "https://example.com/a", "https://example.org/a", false},
+		{"from about:blank", "about:blank", "https://example.com/", false},
+		{"unknown current", "", "https://example.com/", false},
+		{"reload same url", "https://example.com/a", "https://example.com/a", false},
+		{"reload same url with fragment", "https://example.com/a#top", "https://example.com/a#top", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := sameDocumentNavigation(tc.current, tc.target); got != tc.want {
+				t.Errorf("sameDocumentNavigation(%q, %q) = %v, want %v",
+					tc.current, tc.target, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestWaitForContextRolloverDetectsNewContext(t *testing.T) {
+	b, _ := newTestBridge()
+	b.sessions.Add(&cdp.SessionInfo{
+		SessionID:        "page-session-1",
+		JugglerSessionID: "juggler-1",
+		TargetID:         "page-1",
+		Type:             "page",
+	})
+	b.latestCtxMu.Lock()
+	b.latestCtx["juggler-1"] = "id-2"
+	b.latestCtxMu.Unlock()
+
+	if _, ok := b.waitForContext("page-session-1", "id-2", 50*time.Millisecond); ok {
+		t.Fatal("rollover reported while the context was unchanged")
+	}
+	// priorCtx "" is the freshly-attached case: any context will do.
+	if got, ok := b.waitForContext("page-session-1", "", time.Second); !ok || got != "id-2" {
+		t.Fatalf("waitForContext(any) = (%q, %v), want (id-2, true)", got, ok)
+	}
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		b.latestCtxMu.Lock()
+		b.latestCtx["juggler-1"] = "id-3"
+		b.latestCtxMu.Unlock()
+	}()
+	got, ok := b.waitForContext("page-session-1", "id-2", 2*time.Second)
+	if !ok || got != "id-3" {
+		t.Fatalf("waitForContext = (%q, %v), want (id-3, true)", got, ok)
+	}
+}
+
+func TestWaitForMainFrameArrivesLate(t *testing.T) {
+	b, _ := newTestBridge()
+	b.sessions.Add(&cdp.SessionInfo{
+		SessionID:        "page-session-1",
+		JugglerSessionID: "juggler-1",
+		TargetID:         "page-1",
+		Type:             "page",
+	})
+	if _, ok := b.waitForMainFrame("page-session-1", 50*time.Millisecond); ok {
+		t.Fatal("main frame reported before any frame event arrived")
+	}
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		b.sessions.SetFrameID("page-session-1", "mainframe-7")
+	}()
+	frameID, ok := b.waitForMainFrame("page-session-1", 2*time.Second)
+	if !ok || frameID != "mainframe-7" {
+		t.Fatalf("waitForMainFrame = (%q, %v), want (mainframe-7, true)", frameID, ok)
+	}
+	if _, ok := b.waitForMainFrame("", time.Second); ok {
+		t.Fatal("empty session reported a main frame")
+	}
+}
