@@ -208,6 +208,20 @@ func (b *Bridge) SetupEventSubscriptions() {
 		}
 	})
 
+	// Page.navigationStarted carries the frame a navigation is actually running
+	// in, on every navigation. Foxbridge does not surface it to CDP clients —
+	// Chrome has no equivalent — but it is the freshest evidence of which frame
+	// is live, so use it to keep the cached main frame from going stale.
+	b.backend.Subscribe("Page.navigationStarted", func(jugglerSessionID string, params json.RawMessage) {
+		var ev struct {
+			FrameID string `json:"frameId"`
+		}
+		if err := json.Unmarshal(params, &ev); err != nil {
+			return
+		}
+		b.refreshMainFrame(jugglerSessionID, ev.FrameID)
+	})
+
 	// Page.navigationCommitted → Page.frameNavigated (session-scoped)
 	b.backend.Subscribe("Page.navigationCommitted", func(jugglerSessionID string, params json.RawMessage) {
 		var ev struct {
@@ -220,6 +234,8 @@ func (b *Bridge) SetupEventSubscriptions() {
 			log.Printf("events: failed to parse Page.navigationCommitted: %v", err)
 			return
 		}
+
+		b.refreshMainFrame(jugglerSessionID, ev.FrameID)
 
 		cdpSessionID := b.resolveCDPSession(jugglerSessionID)
 		cdpFrameID := b.cdpFrameIDForJugglerSession(jugglerSessionID, ev.FrameID)
@@ -558,6 +574,8 @@ func (b *Bridge) SetupEventSubscriptions() {
 			if info, ok := b.sessions.GetByJugglerSession(jugglerSessionID); ok {
 				b.sessions.SetFrameID(info.SessionID, ev.FrameID)
 			}
+		} else if ev.ParentFrameID != "" {
+			b.noteSubFrame(jugglerSessionID, ev.FrameID)
 		}
 
 		cdpSessionID := b.resolveCDPSession(jugglerSessionID)
@@ -579,6 +597,18 @@ func (b *Bridge) SetupEventSubscriptions() {
 			log.Printf("events: failed to parse Page.frameDetached: %v", err)
 			return
 		}
+
+		// Forget the cached main frame once it goes away. Juggler accepts a stale
+		// frameId on Page.navigate, returns a navigationId and then silently does
+		// nothing, so holding on to a detached frame turns every later navigation
+		// into a no-op that looks like success. Clearing it lets the next
+		// frameAttached / executionContextCreated repopulate the live frame.
+		if info, ok := b.sessions.GetByJugglerSession(jugglerSessionID); ok &&
+			ev.FrameID != "" && info.FrameID == ev.FrameID {
+			b.sessions.SetFrameID(info.SessionID, "")
+			log.Printf("[event] cleared detached main frameID=%s for session %s", ev.FrameID, info.SessionID)
+		}
+		b.forgetSubFrame(jugglerSessionID, ev.FrameID)
 
 		cdpSessionID := b.resolveCDPSession(jugglerSessionID)
 		cdpFrameID := b.cdpFrameIDForJugglerSession(jugglerSessionID, ev.FrameID)

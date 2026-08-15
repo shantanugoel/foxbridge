@@ -32,6 +32,10 @@ type Bridge struct {
 	// latestCtx tracks the most recent Juggler execution context per session
 	latestCtxMu sync.RWMutex
 	latestCtx   map[string]string // jugglerSessionID → latest executionContextId
+	// subFrames tracks frames known to have a parent, so a navigation inside one
+	// is never mistaken for the page's main frame. See refreshMainFrame.
+	subFramesMu sync.RWMutex
+	subFrames   map[string]map[string]bool // jugglerSessionID → set of child frameIDs
 	// isolatedWorlds tracks isolated world names per CDP session for re-emission after navigation
 	isolatedWorldsMu sync.RWMutex
 	isolatedWorlds   map[string][]isolatedWorldInfo // cdpSessionID → list of isolated worlds
@@ -101,6 +105,7 @@ func New(b backend.Backend, sessions *cdp.SessionManager, server *cdp.Server, is
 		ctxCounter:           100,
 		loaderMap:            make(map[string]string),
 		latestCtx:            make(map[string]string),
+		subFrames:            make(map[string]map[string]bool),
 		isolatedWorlds:       make(map[string][]isolatedWorldInfo),
 		nodeObjects:          make(map[int]string),
 		nodeOwners:           make(map[int]string),
@@ -262,6 +267,10 @@ func (b *Bridge) clearConnectionState(records []*targetRecord) {
 		b.latestCtxMu.Lock()
 		delete(b.latestCtx, record.jugglerSessionID)
 		b.latestCtxMu.Unlock()
+
+		b.subFramesMu.Lock()
+		delete(b.subFrames, record.jugglerSessionID)
+		b.subFramesMu.Unlock()
 
 		b.ctxMapMu.Lock()
 		for id, jugglerID := range b.ctxMap {
@@ -583,6 +592,63 @@ func (b *Bridge) sessionForFrame(frameID string) (string, bool) {
 		found = info.SessionID
 	}
 	return found, found != ""
+}
+
+// noteSubFrame records that a frame has a parent, so refreshMainFrame will not
+// mistake a navigation inside it for a top-level one.
+func (b *Bridge) noteSubFrame(jugglerSessionID, frameID string) {
+	if jugglerSessionID == "" || frameID == "" {
+		return
+	}
+	b.subFramesMu.Lock()
+	defer b.subFramesMu.Unlock()
+	frames := b.subFrames[jugglerSessionID]
+	if frames == nil {
+		frames = make(map[string]bool)
+		b.subFrames[jugglerSessionID] = frames
+	}
+	frames[frameID] = true
+}
+
+func (b *Bridge) forgetSubFrame(jugglerSessionID, frameID string) {
+	b.subFramesMu.Lock()
+	defer b.subFramesMu.Unlock()
+	if frames := b.subFrames[jugglerSessionID]; frames != nil {
+		delete(frames, frameID)
+	}
+}
+
+func (b *Bridge) isSubFrame(jugglerSessionID, frameID string) bool {
+	b.subFramesMu.RLock()
+	defer b.subFramesMu.RUnlock()
+	return b.subFrames[jugglerSessionID][frameID]
+}
+
+// refreshMainFrame keeps a session's cached main frame current from an event
+// that carries a live frame ID.
+//
+// The main frame used to be learned once, at attach, from Page.frameAttached or
+// executionContextCreated auxData. If that frame was later replaced without a
+// frameDetached, the cache went stale — and Juggler accepts a stale frameId on
+// Page.navigate, returns a navigationId and then silently does nothing, so every
+// later navigation became a no-op that looked like success. Refreshing on each
+// top-level navigation means the cache cannot drift for more than one event.
+//
+// ponytail: presumes any frame not seen with a parent is the main frame, rather
+// than maintaining a real frame tree. That is exact for pages we attach to
+// before they load. Attaching to an already-loaded page whose subframe attach
+// events we missed could adopt a subframe; build the tree if that shows up.
+func (b *Bridge) refreshMainFrame(jugglerSessionID, frameID string) {
+	if jugglerSessionID == "" || frameID == "" || b.isSubFrame(jugglerSessionID, frameID) {
+		return
+	}
+	info, ok := b.sessions.GetByJugglerSession(jugglerSessionID)
+	if !ok || info.FrameID == frameID {
+		return
+	}
+	b.sessions.SetFrameID(info.SessionID, frameID)
+	log.Printf("[event] refreshed main frameID=%s for session %s (was %q)",
+		frameID, info.SessionID, info.FrameID)
 }
 
 func (b *Bridge) ownerForEvent(raw json.RawMessage, sessionID string) *cdp.Connection {
